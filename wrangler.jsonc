@@ -20,7 +20,7 @@
     {
       "binding": "DB",
       "database_name": "stock-alert",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+      "database_id": "71d4fc6a-c662-4761-afee-5abc3ba20fd5"
     }
   ],
 
