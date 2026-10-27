@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理員設定檢查</title>
+  <link rel="icon" href="/icons/favicon-64.png" type="image/png">
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    .view { padding-bottom: 40px; }
+    textarea.input { height: auto; min-height: 64px; padding: 10px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; word-break: break-all; resize: vertical; }
+    .state { font-size: 13px; font-weight: 500; white-space: nowrap; }
+    .yes { color: var(--down); }
+    .no { color: var(--warn-ink); }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <main class="view">
+      <header class="page-head"><div><h1>管理員設定檢查</h1><p>只有管理員需要看這頁，一般用戶用不到。</p></div></header>
+
+      <div class="row-list" id="status"><div class="row"><span class="muted">檢查中…</span></div></div>
+
+      <div class="card">
+        <b>產生網頁推播金鑰（VAPID）</b>
+        <span class="muted" style="font-size:13px">金鑰在你的瀏覽器裡產生，不會傳到任何地方。按下按鈕後，把兩組金鑰分別存成 Cloudflare 的機密變數（Secret）：<b>VAPID_PUBLIC_KEY</b> 和 <b>VAPID_PRIVATE_KEY</b>。只需要做一次，之後不要更換，否則已開啟推播的用戶要重新開啟。</span>
+        <button class="btn" id="gen">產生金鑰</button>
+        <div id="keys" class="stack hidden">
+          <label class="label" for="pub">VAPID_PUBLIC_KEY</label>
+          <textarea id="pub" class="input" readonly></textarea>
+          <label class="label" for="priv">VAPID_PRIVATE_KEY（請保密）</label>
+          <textarea id="priv" class="input" readonly></textarea>
+        </div>
+      </div>
+      <a class="btn secondary" href="/">回到股票提醒</a>
+    </main>
+  </div>
+  <script>
+    const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    document.getElementById('gen').addEventListener('click', async () => {
+      const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+      const raw = await crypto.subtle.exportKey('raw', pair.publicKey);
+      const jwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+      document.getElementById('pub').value = b64url(raw);
+      document.getElementById('priv').value = jwk.d;
+      document.getElementById('keys').classList.remove('hidden');
+    });
+
+    (async () => {
+      const box = document.getElementById('status');
+      try {
+        const c = await (await fetch('/api/config')).json();
+        const items = [
+          ['真實股價（FINNHUB_KEY）', !c.demo, c.demo ? '未設定：目前是示範模式（模擬股價）' : '已設定'],
+          ['技術指標（TWELVEDATA_KEY）', c.indicators && !c.demo, c.demo ? '示範模式下用模擬資料' : c.indicators ? '已設定' : '未設定：只能用價格和漲跌幅條件'],
+          ['網頁推播（VAPID 金鑰）', c.channels.webpush, c.channels.webpush ? '已設定' : '未設定：用下面的按鈕產生'],
+          ['Telegram（TELEGRAM_BOT_TOKEN）', c.channels.telegram, c.channels.telegram ? `已設定：@${c.telegramBot}` : '未設定（選用）'],
+          ['Discord', true, '不需設定'],
+          ['Email（RESEND_API_KEY、EMAIL_FROM）', c.channels.email, c.channels.email ? '已設定' : '未設定（選用）'],
+        ];
+        box.innerHTML = items
+          .map(([name, ok, text]) => `<div class="row"><div class="main"><b>${name}</b><small>${text}</small></div><span class="state ${ok ? 'yes' : 'no'}">${ok ? '✓' : '—'}</span></div>`)
+          .join('');
+      } catch {
+        box.innerHTML = '<div class="row"><span class="muted">連不上後端，請確認部署是否完成。</span></div>';
+      }
+    })();
+  </script>
+</body>
+</html>

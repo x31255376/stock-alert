@@ -1,0 +1,34 @@
+{
+  // 股票提醒器：網頁 + 後端（Cloudflare Workers）
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stock-alert",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+
+  // 網頁檔案（public/ 資料夾），/api/* 交給後端程式處理
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+
+  // 每分鐘自動執行一次：查股價、檢查條件、發通知
+  "triggers": { "crons": ["* * * * *"] },
+
+  // 資料庫：在 Cloudflare 建好 D1 資料庫後，把它的 ID 貼到下面
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "stock-alert",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ],
+
+  // 在 Cloudflare 後台修改的變數，部署時保留不覆蓋
+  "keep_vars": true,
+  "vars": {
+    "DATA_MODE": "live"
+  },
+
+  "observability": { "enabled": true }
+}

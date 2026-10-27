@@ -1,0 +1,7 @@
+# Local development only (copy to .dev.vars). Never commit real keys.
+DATA_MODE=mock
+FORCE_MARKET_OPEN=1
+DEV_TOOLS=1
+# Optional, to try web push locally (generate at http://localhost:8787/setup.html):
+# VAPID_PUBLIC_KEY=
+# VAPID_PRIVATE_KEY=
