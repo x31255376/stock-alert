@@ -5,6 +5,9 @@
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
 
+  // 開啟 xxx.workers.dev 免費網址
+  "workers_dev": true,
+
   // 網頁檔案（public/ 資料夾），/api/* 交給後端程式處理
   "assets": {
     "directory": "./public",
