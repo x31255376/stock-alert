@@ -3,6 +3,56 @@ import { buildPushPayload } from '@block65/webcrypto-web-push';
 import { getMeta, setMeta, parseJson } from './db.js';
 import { sha256Hex } from './util.js';
 
+// Keys pasted on a phone can pick up spaces/newlines or autocorrected dashes.
+export function cleanKey(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/\u00d7/g, 'x')
+    .replace(/[\u2014]/g, '--')
+    .replace(/[\u2013\u2212]/g, '-');
+}
+
+function vapidKeys(env) {
+  return { publicKey: cleanKey(env.VAPID_PUBLIC_KEY), privateKey: cleanKey(env.VAPID_PRIVATE_KEY) };
+}
+
+function b64urlToBytes(s) {
+  const pad = '='.repeat((4 - (s.length % 4)) % 4);
+  const bin = atob((s + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+}
+
+function bytesToB64url(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Checks that the two VAPID keys belong together: 'ok', 'mismatch' or 'invalid'.
+let vapidCheckCache = null;
+export async function checkVapid(env) {
+  const { publicKey, privateKey } = vapidKeys(env);
+  const tag = `${publicKey}|${privateKey}`;
+  if (vapidCheckCache && vapidCheckCache.tag === tag) return vapidCheckCache.result;
+  let result;
+  try {
+    const pub = b64urlToBytes(publicKey);
+    if (pub.length !== 65 || pub[0] !== 4) throw new Error('bad public key');
+    const x = bytesToB64url(pub.slice(1, 33));
+    const y = bytesToB64url(pub.slice(33, 65));
+    const priv = await crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x, y, d: privateKey }, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+    const verify = await crypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', x, y }, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+    const data = new TextEncoder().encode('vapid-check');
+    const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, priv, data);
+    result = (await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, verify, sig, data)) ? 'ok' : 'mismatch';
+  } catch {
+    result = 'invalid';
+  }
+  vapidCheckCache = { tag, result };
+  return result;
+}
+
 export const CHANNEL_TYPES = ['webpush', 'telegram', 'discord', 'email'];
 
 export function availableChannels(env) {
@@ -19,15 +69,14 @@ export function availableChannels(env) {
 async function sendWebPush(env, appUrl, channel, msg) {
   const meta = parseJson(channel.meta, {});
   const subscription = { endpoint: channel.target, expirationTime: null, keys: meta.keys || {} };
-  const vapid = {
-    subject: env.VAPID_SUBJECT || appUrl || 'mailto:admin@example.com',
-    publicKey: env.VAPID_PUBLIC_KEY,
-    privateKey: env.VAPID_PRIVATE_KEY,
-  };
+  const vapid = { subject: cleanKey(env.VAPID_SUBJECT) || appUrl || 'mailto:admin@example.com', ...vapidKeys(env) };
   const data = JSON.stringify({ title: msg.title, body: msg.body, url: msg.url || '/', tag: msg.tag });
   const payload = await buildPushPayload({ data, options: { ttl: 3600, urgency: 'high' } }, subscription, vapid);
   const res = await fetch(subscription.endpoint, payload);
-  return { ok: res.status >= 200 && res.status < 300, gone: res.status === 404 || res.status === 410, status: res.status };
+  const ok = res.status >= 200 && res.status < 300;
+  // Push services explain rejections in the body (Apple: {"reason":"BadJwtToken"}).
+  const detail = ok ? '' : (await res.text().catch(() => '')).slice(0, 160);
+  return { ok, gone: res.status === 404 || res.status === 410, status: res.status, detail, host: new URL(subscription.endpoint).host };
 }
 
 async function sendTelegram(env, appUrl, channel, msg) {
@@ -89,6 +138,7 @@ export async function deliverToChannels(env, channels, msg, appUrl) {
   const available = availableChannels(env);
   const sentVia = new Set();
   const gone = [];
+  const errors = [];
   await Promise.all(
     channels
       .filter((ch) => available[ch.type])
@@ -97,24 +147,28 @@ export async function deliverToChannels(env, channels, msg, appUrl) {
           const r = await SENDERS[ch.type](env, appUrl, ch, msg);
           if (r.ok) sentVia.add(ch.type);
           else if (r.gone) gone.push(ch);
-          else console.warn('notify failed', ch.type, r.status);
+          else {
+            console.warn('notify failed', ch.type, r.status, r.detail || '');
+            errors.push({ type: ch.type, status: r.status, detail: r.detail || '', host: r.host || '' });
+          }
         } catch (err) {
           console.warn('notify error', ch.type, String(err));
+          errors.push({ type: ch.type, status: 0, detail: String(err && err.message ? err.message : err).slice(0, 160) });
         }
       })
   );
-  return { sentVia: [...sentVia], gone };
+  return { sentVia: [...sentVia], gone, errors };
 }
 
 // Used by the "send a test notification" button.
 export async function sendToUser(env, userId, msg) {
   const db = env.DB;
   const { results } = await db.prepare('SELECT * FROM channels WHERE user_id = ?').bind(userId).all();
-  const { sentVia, gone } = await deliverToChannels(env, results, msg);
+  const { sentVia, gone, errors } = await deliverToChannels(env, results, msg);
   if (gone.length) {
     await db.batch(gone.map((c) => db.prepare('DELETE FROM channels WHERE user_id = ? AND type = ? AND target = ?').bind(c.user_id, c.type, c.target)));
   }
-  return { sentVia, connected: results.length };
+  return { sentVia, connected: results.length, gone: gone.map((c) => c.type), errors };
 }
 
 // ---------- Telegram bot setup ----------

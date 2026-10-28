@@ -54,7 +54,7 @@
         const items = [
           ['真實股價（FINNHUB_KEY）', !c.demo, c.demo ? '未設定：目前是示範模式（模擬股價）' : '已設定'],
           ['技術指標（TWELVEDATA_KEY）', c.indicators && !c.demo, c.demo ? '示範模式下用模擬資料' : c.indicators ? '已設定' : '未設定：只能用價格和漲跌幅條件'],
-          ['網頁推播（VAPID 金鑰）', c.channels.webpush, c.channels.webpush ? '已設定' : '未設定：用下面的按鈕產生'],
+          ['網頁推播（VAPID 金鑰）', c.channels.webpush && c.vapidCheck === 'ok', !c.channels.webpush ? '未設定：用下面的按鈕產生' : c.vapidCheck === 'ok' ? '已設定，兩組金鑰配對正確' : c.vapidCheck === 'mismatch' ? '兩組金鑰不是同一對：請用下面按鈕重新產生，兩個一起重存' : '金鑰格式錯誤（可能複製不完整）：請重新產生，兩個一起重存'],
           ['Telegram（TELEGRAM_BOT_TOKEN）', c.channels.telegram, c.channels.telegram ? `已設定：@${c.telegramBot}` : '未設定（選用）'],
           ['Discord', true, '不需設定'],
           ['Email（RESEND_API_KEY、EMAIL_FROM）', c.channels.email, c.channels.email ? '已設定' : '未設定（選用）'],

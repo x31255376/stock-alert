@@ -26,6 +26,8 @@ import {
   sendRawEmail,
   deliverToChannels,
   CHANNEL_TYPES,
+  checkVapid,
+  cleanKey,
 } from './notify.js';
 
 const MAX_WATCHLIST = 50;
@@ -95,11 +97,6 @@ async function rateLimit(db, name, subject, now) {
   if (row && row.count > max) throw new HttpError(429, '操作太頻繁了，請稍後再試', 'Too many requests. Please wait a moment and try again.');
 }
 
-// Keys pasted on a phone sometimes get autocorrected ("0x" → "0×") or pick up spaces.
-function cleanKey(value) {
-  return String(value || '').trim().replace(/\u00d7/g, 'x');
-}
-
 // Cloudflare Turnstile (bot check). Only enforced when TURNSTILE_SECRET is set.
 async function checkTurnstile(env, request, token) {
   if (!env.TURNSTILE_SECRET) return;
@@ -145,7 +142,8 @@ async function route(request, env, ctx, url, lang) {
       demo: isDemo(env),
       indicators: hasBarSource(env),
       channels,
-      vapidPublicKey: channels.webpush ? env.VAPID_PUBLIC_KEY : null,
+      vapidPublicKey: channels.webpush ? cleanKey(env.VAPID_PUBLIC_KEY) : null,
+      vapidCheck: channels.webpush ? await checkVapid(env) : null,
       telegramBot,
       turnstileSiteKey: env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY ? cleanKey(env.TURNSTILE_SITE_KEY) : null,
       recovery: channels.email,
@@ -473,15 +471,25 @@ async function route(request, env, ctx, url, lang) {
   }
 
   if (path === '/api/test' && method === 'POST') {
-    const { sentVia, connected } = await sendToUser(env, user.id, {
+    const { sentVia, connected, gone, errors } = await sendToUser(env, user.id, {
       title: tr(user.lang, '測試通知 ✓', 'Test notification ✓'),
       body: tr(user.lang, '收到這則訊息，代表股票提醒可以正常通知你。', 'If you can see this, Stock Alerts can reach you.'),
       url: '/#/settings',
       tag: 'test',
     });
     if (!connected) throw bad('還沒有連接任何通知方式', 'No notification method is connected yet');
-    if (!sentVia.length) throw new HttpError(502, '測試通知送出失敗，請重新連接通知方式', 'The test notification failed. Please reconnect your notification method.');
-    return json({ sentVia });
+    if (!sentVia.length) {
+      const why = [
+        ...errors.map((e) => `${e.type}${e.host ? ` @ ${e.host}` : ''}: ${e.status || ''} ${e.detail}`.trim()),
+        ...gone.map((t) => `${t}: subscription expired`),
+      ].join('; ');
+      throw new HttpError(
+        502,
+        `測試通知送出失敗，請重新連接通知方式。（${why || '沒有可用的通知方式'}）`,
+        `The test notification failed. Please reconnect your notification method. (${why || 'no usable method'})`
+      );
+    }
+    return json({ sentVia, errors });
   }
 
   throw new HttpError(404, '找不到這個功能', 'Not found');
