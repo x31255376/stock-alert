@@ -1,9 +1,11 @@
-// JSON API used by the web app.
+// JSON API used by the web app. User-facing text is Traditional Chinese or English (per request / per user).
 import { ensureSchema, getMeta, setMeta, parseJson, upsertQuoteStmt, quoteFromRow } from './db.js';
 import {
   json,
   HttpError,
   bad,
+  tr,
+  pickLang,
   randomCode,
   randomHex,
   formatAccountCode,
@@ -30,9 +32,19 @@ const MAX_WATCHLIST = 50;
 const MAX_ALERTS = 30;
 let knownOrigin = null;
 
+// Per-IP / per-user request limits: [max requests, window in ms].
+const LIMITS = {
+  account: [5, 3600000], // new accounts per IP per hour
+  login: [20, 900000], // login attempts per IP per 15 minutes
+  recover: [5, 3600000], // recovery emails per IP per hour
+  search: [60, 60000], // searches per account per minute
+  write: [120, 60000], // changes per account per minute
+};
+
 export async function handleApi(request, env, ctx) {
   const url = new URL(request.url);
   const db = env.DB;
+  const lang = pickLang(request.headers.get('x-lang') || request.headers.get('accept-language'));
   await ensureSchema(db);
 
   // Remember the public URL so the background job can build links (Telegram webhook, notifications).
@@ -46,12 +58,11 @@ export async function handleApi(request, env, ctx) {
   }
 
   try {
-    const res = await route(request, env, ctx, url);
-    return res;
+    return await route(request, env, ctx, url, lang);
   } catch (err) {
-    if (err instanceof HttpError) return json({ error: err.message }, err.status);
+    if (err instanceof HttpError) return json({ error: lang === 'en' ? err.en : err.message }, err.status);
     console.error(err);
-    return json({ error: '伺服器發生錯誤，請稍後再試' }, 500);
+    return json({ error: tr(lang, '伺服器發生錯誤，請稍後再試', 'Something went wrong. Please try again.') }, 500);
   }
 }
 
@@ -59,24 +70,59 @@ async function readBody(request) {
   try {
     return await request.json();
   } catch {
-    throw bad('資料格式錯誤');
+    throw bad('資料格式錯誤', 'Invalid request');
   }
+}
+
+function clientIp(request) {
+  return request.headers.get('cf-connecting-ip') || 'local';
+}
+
+// Fixed-window counter in D1. Throws 429 when over the limit.
+async function rateLimit(db, name, subject, now) {
+  const [max, windowMs] = LIMITS[name];
+  const key = `${name}:${subject}`;
+  const row = await db
+    .prepare(
+      `INSERT INTO rate (key, count, reset_at) VALUES (?, 1, ?)
+       ON CONFLICT(key) DO UPDATE SET
+         count = CASE WHEN rate.reset_at <= ? THEN 1 ELSE rate.count + 1 END,
+         reset_at = CASE WHEN rate.reset_at <= ? THEN excluded.reset_at ELSE rate.reset_at END
+       RETURNING count`
+    )
+    .bind(key, now + windowMs, now, now)
+    .first();
+  if (row && row.count > max) throw new HttpError(429, '操作太頻繁了，請稍後再試', 'Too many requests. Please wait a moment and try again.');
+}
+
+// Cloudflare Turnstile (bot check). Only enforced when TURNSTILE_SECRET is set.
+async function checkTurnstile(env, request, token) {
+  if (!env.TURNSTILE_SECRET) return;
+  if (!token) throw bad('請先完成機器人驗證', 'Please complete the verification first');
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('response', String(token));
+  form.append('remoteip', clientIp(request));
+  const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
+  const data = await res.json().catch(() => ({}));
+  if (!data.success) throw bad('機器人驗證沒有通過，請再試一次', 'Verification failed. Please try again.');
 }
 
 async function requireUser(request, env) {
   const auth = request.headers.get('authorization') || '';
   const code = normalizeAccountCode(auth.replace(/^Bearer\s+/i, ''));
-  if (code.length !== 16) throw new HttpError(401, '請先登入');
+  if (code.length !== 16) throw new HttpError(401, '請先登入', 'Please sign in');
   const user = await env.DB.prepare('SELECT * FROM users WHERE code_hash = ?').bind(await sha256Hex(code)).first();
-  if (!user) throw new HttpError(401, '帳號代碼不存在');
+  if (!user) throw new HttpError(401, '帳號代碼不存在', 'Account code not found');
   return user;
 }
 
-async function route(request, env, ctx, url) {
+async function route(request, env, ctx, url, lang) {
   const db = env.DB;
   const method = request.method;
   const path = url.pathname.replace(/\/+$/, '');
   const now = Date.now();
+  const ip = clientIp(request);
 
   // ---------- public ----------
   if (path === '/api/config' && method === 'GET') {
@@ -96,29 +142,77 @@ async function route(request, env, ctx, url) {
       channels,
       vapidPublicKey: channels.webpush ? env.VAPID_PUBLIC_KEY : null,
       telegramBot,
+      turnstileSiteKey: env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY ? env.TURNSTILE_SITE_KEY : null,
+      recovery: channels.email,
       market: marketInfo(env, now),
     });
   }
 
   if (path === '/api/account' && method === 'POST') {
     const body = await readBody(request);
+    await rateLimit(db, 'account', ip, now);
+    await checkTurnstile(env, request, body.turnstile);
     const code = randomCode(16);
     const id = randomHex(12);
     const tz = isValidTimeZone(body.tz) ? body.tz : 'UTC';
     await db
-      .prepare('INSERT INTO users (id, code_hash, tz, created_at) VALUES (?, ?, ?, ?)')
-      .bind(id, await sha256Hex(code), tz, now)
+      .prepare('INSERT INTO users (id, code_hash, tz, lang, created_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(id, await sha256Hex(code), tz, pickLang(body.lang || lang), now)
       .run();
     return json({ code: formatAccountCode(code) });
   }
 
   if (path === '/api/login' && method === 'POST') {
     const body = await readBody(request);
+    await rateLimit(db, 'login', ip, now);
     const code = normalizeAccountCode(body.code);
-    if (code.length !== 16) throw bad('帳號代碼是 16 個字元');
+    if (code.length !== 16) throw bad('帳號代碼是 16 個字元', 'The account code has 16 characters');
     const user = await db.prepare('SELECT id FROM users WHERE code_hash = ?').bind(await sha256Hex(code)).first();
-    if (!user) throw new HttpError(404, '找不到這組帳號代碼，請再確認一次');
+    if (!user) throw new HttpError(404, '找不到這組帳號代碼，請再確認一次', 'Account code not found. Please check it and try again.');
     return json({ code: formatAccountCode(code) });
+  }
+
+  // Forgot the account code: email a one-time link to the verified Email channel.
+  if (path === '/api/recover' && method === 'POST') {
+    if (!availableChannels(env).email) throw bad('Email 功能尚未開放', 'Email is not available');
+    const body = await readBody(request);
+    await rateLimit(db, 'recover', ip, now);
+    await checkTurnstile(env, request, body.turnstile);
+    const address = String(body.address || '').trim().toLowerCase();
+    if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/.test(address)) throw bad('Email 格式不正確', 'Invalid email address');
+    const { results } = await db
+      .prepare("SELECT u.id, u.lang FROM channels c JOIN users u ON u.id = c.user_id WHERE c.type = 'email' AND c.target = ? LIMIT 3")
+      .bind(address)
+      .all();
+    for (const u of results) {
+      const c = randomHex(16);
+      await db.prepare("INSERT INTO link_codes (code, user_id, kind, expires_at) VALUES (?, ?, 'recover', ?)").bind(c, u.id, now + 30 * 60000).run();
+      const link = `${url.origin}/api/recover/verify?c=${c}`;
+      await sendRawEmail(
+        env,
+        address,
+        tr(u.lang, '找回你的股票提醒帳號', 'Recover your Stock Alerts account'),
+        tr(
+          u.lang,
+          `點下面的連結，會產生一組新的帳號代碼並登入（舊代碼會失效，其他裝置需要用新代碼重新登入）：\n\n${link}\n\n連結 30 分鐘內有效。如果不是你本人操作，忽略這封信即可。`,
+          `Open the link below to get a new account code and sign in (the old code stops working; other devices will need the new code):\n\n${link}\n\nThe link expires in 30 minutes. If this wasn't you, ignore this email.`
+        )
+      );
+    }
+    // Same answer whether or not the address is registered.
+    return json({ ok: true });
+  }
+
+  if (path === '/api/recover/verify' && method === 'GET') {
+    const c = url.searchParams.get('c') || '';
+    const link = await db.prepare("SELECT * FROM link_codes WHERE code = ? AND kind = 'recover'").bind(c).first();
+    if (!link || link.expires_at < now) return Response.redirect(`${url.origin}/#/?recover=expired`, 302);
+    const code = randomCode(16);
+    await db.batch([
+      db.prepare('UPDATE users SET code_hash = ? WHERE id = ?').bind(await sha256Hex(code), link.user_id),
+      db.prepare("DELETE FROM link_codes WHERE user_id = ? AND kind = 'recover'").bind(link.user_id),
+    ]);
+    return Response.redirect(`${url.origin}/#/recovered?c=${formatAccountCode(code)}`, 302);
   }
 
   if (path === '/api/telegram/webhook' && method === 'POST') {
@@ -139,6 +233,7 @@ async function route(request, env, ctx, url) {
 
   // ---------- signed in ----------
   const user = await requireUser(request, env);
+  if (method !== 'GET') await rateLimit(db, 'write', user.id, now);
 
   if (path === '/api/me') {
     if (method === 'GET') return json(await meResponse(env, user));
@@ -147,47 +242,49 @@ async function route(request, env, ctx, url) {
       const tz = body.tz !== undefined ? (isValidTimeZone(body.tz) ? body.tz : user.tz) : user.tz;
       const minutes = (v, d) => (Number.isInteger(v) && v >= 0 && v < 1440 ? v : d);
       const quietOn = body.quietOn !== undefined ? (body.quietOn ? 1 : 0) : user.quiet_on;
+      const newLang = body.lang !== undefined ? pickLang(body.lang) : user.lang;
       await db
-        .prepare('UPDATE users SET tz = ?, quiet_on = ?, quiet_start = ?, quiet_end = ? WHERE id = ?')
-        .bind(tz, quietOn, minutes(body.quietStart, user.quiet_start), minutes(body.quietEnd, user.quiet_end), user.id)
+        .prepare('UPDATE users SET tz = ?, quiet_on = ?, quiet_start = ?, quiet_end = ?, lang = ? WHERE id = ?')
+        .bind(tz, quietOn, minutes(body.quietStart, user.quiet_start), minutes(body.quietEnd, user.quiet_end), newLang, user.id)
         .run();
       const fresh = await db.prepare('SELECT * FROM users WHERE id = ?').bind(user.id).first();
       return json(await meResponse(env, fresh));
     }
     if (method === 'DELETE') {
       await db.batch(
-        ['watchlist', 'alerts', 'events', 'channels', 'link_codes'].map((t) => db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).bind(user.id)).concat([
-          db.prepare('DELETE FROM users WHERE id = ?').bind(user.id),
-        ])
+        ['watchlist', 'alerts', 'events', 'channels', 'link_codes']
+          .map((t) => db.prepare(`DELETE FROM ${t} WHERE user_id = ?`).bind(user.id))
+          .concat([db.prepare('DELETE FROM users WHERE id = ?').bind(user.id)])
       );
       return json({ ok: true });
     }
   }
 
   if (path === '/api/search' && method === 'GET') {
+    await rateLimit(db, 'search', user.id, now);
     const q = (url.searchParams.get('q') || '').slice(0, 40);
     try {
       return json({ results: await searchSymbols(env, q) });
     } catch (err) {
       console.warn('search', String(err));
-      throw new HttpError(502, '搜尋暫時無法使用，請稍後再試');
+      throw new HttpError(502, '搜尋暫時無法使用，請稍後再試', 'Search is unavailable right now. Please try again later.');
     }
   }
 
   if (path === '/api/watchlist') {
-    if (method === 'GET') return json(await watchlistResponse(env, user, now));
+    if (method === 'GET') return json(await watchlistResponse(env, user, now, lang));
     if (method === 'POST') {
       const body = await readBody(request);
       const symbol = String(body.symbol || '').toUpperCase().trim();
-      if (!isValidSymbol(symbol)) throw bad('股票代號格式不正確');
+      if (!isValidSymbol(symbol)) throw bad('股票代號格式不正確', 'Invalid ticker symbol');
       const count = await db.prepare('SELECT COUNT(*) AS n FROM watchlist WHERE user_id = ?').bind(user.id).first();
-      if (count.n >= MAX_WATCHLIST) throw bad(`自選股最多 ${MAX_WATCHLIST} 支`);
+      if (count.n >= MAX_WATCHLIST) throw bad(`自選股最多 ${MAX_WATCHLIST} 支`, `Your watchlist can hold up to ${MAX_WATCHLIST} symbols`);
       await ensureQuote(env, symbol, now);
       await db
         .prepare('INSERT OR IGNORE INTO watchlist (user_id, symbol, name, added_at) VALUES (?, ?, ?, ?)')
         .bind(user.id, symbol, String(body.name || symbol).slice(0, 80), now)
         .run();
-      return json(await watchlistResponse(env, user, now));
+      return json(await watchlistResponse(env, user, now, lang));
     }
   }
 
@@ -205,7 +302,7 @@ async function route(request, env, ctx, url) {
     const body = await readBody(request);
     const fields = cleanAlertInput(body, true);
     const count = await db.prepare('SELECT COUNT(*) AS n FROM alerts WHERE user_id = ? AND active = 1').bind(user.id).first();
-    if (count.n >= MAX_ALERTS) throw bad(`啟用中的提醒最多 ${MAX_ALERTS} 個`);
+    if (count.n >= MAX_ALERTS) throw bad(`啟用中的提醒最多 ${MAX_ALERTS} 個`, `You can have up to ${MAX_ALERTS} active alerts`);
     await ensureQuote(env, fields.symbol, now);
     const inserted = await db.batch([
       db
@@ -219,19 +316,21 @@ async function route(request, env, ctx, url) {
         .bind(user.id, fields.symbol, fields.logic, JSON.stringify(fields.conditions), fields.channels, fields.frequency, now),
     ]);
     const row = inserted[1].results[0];
+    const ul = user.lang;
+    const joiner = row.logic === 'any' ? tr(ul, ' 或 ', ' OR ') : tr(ul, ' 且 ', ' AND ');
     await db
       .prepare("INSERT INTO events (user_id, alert_id, symbol, kind, title, body, created_at) VALUES (?, ?, ?, 'created', ?, ?, ?)")
-      .bind(user.id, row.id, row.symbol, `${row.symbol} 提醒已建立`, fields.conditions.map(describeCondition).join(row.logic === 'any' ? ' 或 ' : ' 且 '), now)
+      .bind(user.id, row.id, row.symbol, tr(ul, `${row.symbol} 提醒已建立`, `${row.symbol} alert created`), fields.conditions.map((c) => describeCondition(c, ul)).join(joiner), now)
       .run();
-    return json({ alert: alertResponse(row) });
+    return json({ alert: alertResponse(row, lang) });
   }
 
   m = path.match(/^\/api\/alerts\/(\d+)$/);
   if (m) {
     const id = Number(m[1]);
     const row = await db.prepare('SELECT * FROM alerts WHERE id = ? AND user_id = ?').bind(id, user.id).first();
-    if (!row) throw new HttpError(404, '找不到這個提醒');
-    if (method === 'GET') return json({ alert: alertResponse(row) });
+    if (!row) throw new HttpError(404, '找不到這個提醒', 'Alert not found');
+    if (method === 'GET') return json({ alert: alertResponse(row, lang) });
     if (method === 'DELETE') {
       await db.prepare('DELETE FROM alerts WHERE id = ?').bind(id).run();
       return json({ ok: true });
@@ -253,7 +352,7 @@ async function route(request, env, ctx, url) {
         )
         .bind(fields.logic, JSON.stringify(fields.conditions), fields.channels, fields.frequency, active, ...Array(5).fill(changed ? 1 : 0), id)
         .first();
-      return json({ alert: alertResponse(updated) });
+      return json({ alert: alertResponse(updated, lang) });
     }
   }
 
@@ -283,11 +382,11 @@ async function route(request, env, ctx, url) {
   if (path === '/api/channels/webpush') {
     const body = await readBody(request);
     const endpoint = String(body.endpoint || body.subscription?.endpoint || '');
-    if (!/^https:\/\//.test(endpoint) || endpoint.length > 1000) throw bad('推播訂閱資料不正確');
+    if (!/^https:\/\//.test(endpoint) || endpoint.length > 1000) throw bad('推播訂閱資料不正確', 'Invalid push subscription');
     if (method === 'POST') {
-      if (!availableChannels(env).webpush) throw bad('網頁推播尚未設定');
+      if (!availableChannels(env).webpush) throw bad('網頁推播尚未設定', 'Web push is not set up yet');
       const keys = body.subscription?.keys || {};
-      if (!keys.p256dh || !keys.auth) throw bad('推播訂閱資料不正確');
+      if (!keys.p256dh || !keys.auth) throw bad('推播訂閱資料不正確', 'Invalid push subscription');
       await db
         .prepare(
           `INSERT INTO channels (user_id, type, target, meta, created_at) VALUES (?, 'webpush', ?, ?, ?)
@@ -306,13 +405,10 @@ async function route(request, env, ctx, url) {
   }
 
   if (path === '/api/channels/telegram' && method === 'POST') {
-    if (!availableChannels(env).telegram) throw bad('Telegram 尚未設定');
+    if (!availableChannels(env).telegram) throw bad('Telegram 尚未設定', 'Telegram is not set up yet');
     const username = await ensureTelegramWebhook(env, url.origin);
     const code = randomHex(12);
-    await db
-      .prepare("INSERT INTO link_codes (code, user_id, kind, expires_at) VALUES (?, ?, 'telegram', ?)")
-      .bind(code, user.id, now + 30 * 60000)
-      .run();
+    await db.prepare("INSERT INTO link_codes (code, user_id, kind, expires_at) VALUES (?, ?, 'telegram', ?)").bind(code, user.id, now + 30 * 60000).run();
     return json({ url: `https://t.me/${username}?start=${code}` });
   }
 
@@ -320,11 +416,14 @@ async function route(request, env, ctx, url) {
     const body = await readBody(request);
     const hook = String(body.url || '').trim();
     if (!/^https:\/\/(canary\.|ptb\.)?(discord|discordapp)\.com\/api\/webhooks\/\d+\/[\w-]+$/.test(hook)) {
-      throw bad('這不是 Discord Webhook 網址，應該像 https://discord.com/api/webhooks/…');
+      throw bad('這不是 Discord Webhook 網址，應該像 https://discord.com/api/webhooks/…', 'That is not a Discord webhook URL. It should look like https://discord.com/api/webhooks/…');
     }
     const ch = { user_id: user.id, type: 'discord', target: hook };
-    const { sentVia } = await deliverToChannels(env, [ch], { title: '股票提醒已連接 ✓', body: '之後觸發的提醒會傳到這個頻道。' });
-    if (!sentVia.length) throw bad('傳送測試訊息失敗，請確認 Webhook 網址還有效');
+    const { sentVia } = await deliverToChannels(env, [ch], {
+      title: tr(user.lang, '股票提醒已連接 ✓', 'Stock Alerts connected ✓'),
+      body: tr(user.lang, '之後觸發的提醒會傳到這個頻道。', 'Triggered alerts will be posted to this channel.'),
+    });
+    if (!sentVia.length) throw bad('傳送測試訊息失敗，請確認 Webhook 網址還有效', 'Could not post a test message. Check that the webhook URL is still valid.');
     await db.batch([
       db.prepare("DELETE FROM channels WHERE user_id = ? AND type = 'discord'").bind(user.id),
       db.prepare("INSERT INTO channels (user_id, type, target, created_at) VALUES (?, 'discord', ?, ?)").bind(user.id, hook, now),
@@ -333,27 +432,32 @@ async function route(request, env, ctx, url) {
   }
 
   if (path === '/api/channels/email' && method === 'POST') {
-    if (!availableChannels(env).email) throw bad('Email 通知尚未設定');
+    if (!availableChannels(env).email) throw bad('Email 通知尚未設定', 'Email notifications are not set up yet');
     const body = await readBody(request);
     const address = String(body.address || '').trim().toLowerCase();
-    if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/.test(address)) throw bad('Email 格式不正確');
+    if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/.test(address)) throw bad('Email 格式不正確', 'Invalid email address');
     const recent = await db
       .prepare("SELECT COUNT(*) AS n FROM link_codes WHERE user_id = ? AND kind = 'email' AND expires_at > ?")
       .bind(user.id, now + 23 * 3600000)
       .first();
-    if (recent.n >= 3) throw bad('驗證信寄太多次了，請一小時後再試');
+    if (recent.n >= 3) throw bad('驗證信寄太多次了，請一小時後再試', 'Too many verification emails. Please try again in an hour.');
     const code = randomHex(16);
     await db
       .prepare("INSERT INTO link_codes (code, user_id, kind, payload, expires_at) VALUES (?, ?, 'email', ?, ?)")
       .bind(code, user.id, address, now + 24 * 3600000)
       .run();
+    const link = `${url.origin}/api/email/verify?c=${code}`;
     const r = await sendRawEmail(
       env,
       address,
-      '確認你的股票提醒 Email',
-      `點下面的連結，之後的股票提醒就會寄到這個信箱：\n\n${url.origin}/api/email/verify?c=${code}\n\n如果不是你本人操作，忽略這封信即可。`
+      tr(user.lang, '確認你的股票提醒 Email', 'Confirm your email for Stock Alerts'),
+      tr(
+        user.lang,
+        `點下面的連結，之後的股票提醒就會寄到這個信箱，忘記帳號代碼時也能用它找回：\n\n${link}\n\n如果不是你本人操作，忽略這封信即可。`,
+        `Open the link below to receive stock alerts at this address. You can also use it to recover your account code:\n\n${link}\n\nIf this wasn't you, ignore this email.`
+      )
     );
-    if (!r.ok) throw new HttpError(502, '驗證信寄送失敗，請稍後再試');
+    if (!r.ok) throw new HttpError(502, '驗證信寄送失敗，請稍後再試', 'Could not send the verification email. Please try again later.');
     return json({ ok: true });
   }
 
@@ -365,17 +469,17 @@ async function route(request, env, ctx, url) {
 
   if (path === '/api/test' && method === 'POST') {
     const { sentVia, connected } = await sendToUser(env, user.id, {
-      title: '測試通知 ✓',
-      body: '收到這則訊息，代表股票提醒可以正常通知你。',
+      title: tr(user.lang, '測試通知 ✓', 'Test notification ✓'),
+      body: tr(user.lang, '收到這則訊息，代表股票提醒可以正常通知你。', 'If you can see this, Stock Alerts can reach you.'),
       url: '/#/settings',
       tag: 'test',
     });
-    if (!connected) throw bad('還沒有連接任何通知方式');
-    if (!sentVia.length) throw new HttpError(502, '測試通知送出失敗，請重新連接通知方式');
+    if (!connected) throw bad('還沒有連接任何通知方式', 'No notification method is connected yet');
+    if (!sentVia.length) throw new HttpError(502, '測試通知送出失敗，請重新連接通知方式', 'The test notification failed. Please reconnect your notification method.');
     return json({ sentVia });
   }
 
-  throw new HttpError(404, '找不到這個功能');
+  throw new HttpError(404, '找不到這個功能', 'Not found');
 }
 
 // ---------- helpers ----------
@@ -387,30 +491,25 @@ function marketInfo(env, now) {
 
 function cleanAlertInput(body, isNew) {
   const symbol = String(body.symbol || '').toUpperCase().trim();
-  if (isNew && !isValidSymbol(symbol)) throw bad('請先選擇股票');
+  if (isNew && !isValidSymbol(symbol)) throw bad('請先選擇股票', 'Please choose a stock first');
   const list = Array.isArray(body.conditions) ? body.conditions : [];
-  if (!list.length) throw bad('至少需要一個條件');
-  if (list.length > MAX_CONDITIONS) throw bad(`條件最多 ${MAX_CONDITIONS} 個`);
-  let conditions;
-  try {
-    conditions = list.map(sanitizeCondition);
-  } catch (err) {
-    throw bad(err.message);
-  }
+  if (!list.length) throw bad('至少需要一個條件', 'Add at least one condition');
+  if (list.length > MAX_CONDITIONS) throw bad(`條件最多 ${MAX_CONDITIONS} 個`, `Up to ${MAX_CONDITIONS} conditions`);
+  const conditions = list.map(sanitizeCondition);
   const logic = body.logic === 'any' ? 'any' : 'all';
   const frequency = FREQUENCIES.includes(body.frequency) ? body.frequency : 'daily';
   const channels = Array.isArray(body.channels) ? body.channels.filter((c) => CHANNEL_TYPES.includes(c)) : [];
   return { symbol, logic, conditions, frequency, channels: channels.length ? JSON.stringify([...new Set(channels)]) : null };
 }
 
-export function alertResponse(row) {
+export function alertResponse(row, lang = 'zh') {
   const conditions = parseJson(row.conditions, []);
   return {
     id: row.id,
     symbol: row.symbol,
     logic: row.logic,
     conditions,
-    labels: conditions.map(describeCondition),
+    labels: conditions.map((c) => describeCondition(c, lang)),
     timing: alertTiming(conditions),
     channels: parseJson(row.channels, []),
     frequency: row.frequency,
@@ -427,11 +526,12 @@ async function meResponse(env, user) {
   const channels = results.map((c) => ({
     type: c.type,
     // Only Web Push needs the real target (so a device knows whether it is subscribed).
-    target: c.type === 'webpush' ? c.target : c.type === 'email' ? c.target : c.type === 'discord' ? 'Discord 頻道' : 'Telegram',
+    target: c.type === 'webpush' || c.type === 'email' ? c.target : c.type === 'discord' ? 'Discord' : 'Telegram',
     device: c.type === 'webpush' ? parseJson(c.meta, {}).ua || '' : '',
   }));
   return {
     tz: user.tz,
+    lang: user.lang || 'zh',
     quietOn: Boolean(user.quiet_on),
     quietStart: user.quiet_start,
     quietEnd: user.quiet_end,
@@ -449,14 +549,14 @@ async function ensureQuote(env, symbol, now) {
   } catch (err) {
     console.warn('quote', symbol, String(err));
     if (row) return quoteFromRow(row);
-    throw new HttpError(502, '暫時查不到股價，請稍後再試');
+    throw new HttpError(502, '暫時查不到股價，請稍後再試', 'Could not get a price right now. Please try again later.');
   }
-  if (!q) throw bad(`找不到 ${symbol} 這個股票代號`);
+  if (!q) throw bad(`找不到 ${symbol} 這個股票代號`, `Ticker ${symbol} was not found`);
   await upsertQuoteStmt(env.DB, symbol, q, now).run();
   return q;
 }
 
-async function watchlistResponse(env, user, now) {
+async function watchlistResponse(env, user, now, lang) {
   const db = env.DB;
   const [wl, alerts] = await db.batch([
     db.prepare('SELECT * FROM watchlist WHERE user_id = ? ORDER BY added_at').bind(user.id),
@@ -490,7 +590,7 @@ async function watchlistResponse(env, user, now) {
       symbol: w.symbol,
       name: w.name,
       quote: quotes.get(w.symbol) || null,
-      alerts: alerts.results.filter((a) => a.symbol === w.symbol).map(alertResponse),
+      alerts: alerts.results.filter((a) => a.symbol === w.symbol).map((a) => alertResponse(a, lang)),
     })),
   };
 }
@@ -510,9 +610,9 @@ async function telegramWebhook(request, env) {
   const db = env.DB;
   const start = text.match(/^\/start\s+([a-f0-9]{24})$/);
   if (start) {
-    const link = await db.prepare("SELECT * FROM link_codes WHERE code = ? AND kind = 'telegram'").bind(start[1]).first();
+    const link = await db.prepare("SELECT l.*, u.lang FROM link_codes l JOIN users u ON u.id = l.user_id WHERE l.code = ? AND l.kind = 'telegram'").bind(start[1]).first();
     if (!link || link.expires_at < Date.now()) {
-      await telegramReply(env, chatId, '這個連接已過期，請回到網頁重新按「連接 Telegram」。');
+      await telegramReply(env, chatId, '這個連接已過期，請回到網頁重新按「連接 Telegram」。\nThis link has expired. Go back to the website and tap "Connect" again.');
       return json({ ok: true });
     }
     await db.batch([
@@ -520,14 +620,18 @@ async function telegramWebhook(request, env) {
       db.prepare("INSERT INTO channels (user_id, type, target, created_at) VALUES (?, 'telegram', ?, ?)").bind(link.user_id, chatId, Date.now()),
       db.prepare('DELETE FROM link_codes WHERE code = ?').bind(start[1]),
     ]);
-    await telegramReply(env, chatId, '連接成功 ✓\n之後股票提醒觸發時，會在這裡通知你。');
+    await telegramReply(env, chatId, tr(link.lang, '連接成功 ✓\n之後股票提醒觸發時，會在這裡通知你。', 'Connected ✓\nYou will get your stock alerts here.'));
     return json({ ok: true });
   }
   if (text === '/stop') {
     await db.prepare("DELETE FROM channels WHERE type = 'telegram' AND target = ?").bind(chatId).run();
-    await telegramReply(env, chatId, '已停止 Telegram 通知。要重新開啟，請到網頁的「通知設定」。');
+    await telegramReply(env, chatId, '已停止 Telegram 通知。\nTelegram notifications stopped.');
     return json({ ok: true });
   }
-  await telegramReply(env, chatId, '這是股票提醒的通知機器人。請到網頁的「通知設定」按「連接 Telegram」來開始接收提醒。\n輸入 /stop 可以停止通知。');
+  await telegramReply(
+    env,
+    chatId,
+    '這是股票提醒的通知機器人。請到網頁的「通知設定」按「連接」Telegram。輸入 /stop 可停止通知。\n\nThis is the Stock Alerts bot. Open Settings on the website and tap "Connect" next to Telegram. Send /stop to stop notifications.'
+  );
   return json({ ok: true });
 }

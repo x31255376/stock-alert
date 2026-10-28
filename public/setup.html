@@ -58,6 +58,8 @@
           ['Telegram（TELEGRAM_BOT_TOKEN）', c.channels.telegram, c.channels.telegram ? `已設定：@${c.telegramBot}` : '未設定（選用）'],
           ['Discord', true, '不需設定'],
           ['Email（RESEND_API_KEY、EMAIL_FROM）', c.channels.email, c.channels.email ? '已設定' : '未設定（選用）'],
+          ['防機器人驗證（TURNSTILE_SITE_KEY、TURNSTILE_SECRET）', Boolean(c.turnstileSiteKey), c.turnstileSiteKey ? '已設定' : '未設定（公開給大家用之前建議設定）'],
+          ['找回帳號代碼', c.recovery, c.recovery ? '已開放（透過已驗證的 Email）' : '需要先設定 Email 通知'],
         ];
         box.innerHTML = items
           .map(([name, ok, text]) => `<div class="row"><div class="main"><b>${name}</b><small>${text}</small></div><span class="state ${ok ? 'yes' : 'no'}">${ok ? '✓' : '—'}</span></div>`)

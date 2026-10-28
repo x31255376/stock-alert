@@ -41,25 +41,41 @@ function rsiValue(avgGain, avgLoss) {
   return 100 - 100 / (1 + rs);
 }
 
-// Stochastic KD (9,3,3), the version common in Taiwan / Asia:
-// RSV = (C - lowest low of n) / (highest high of n - lowest low of n) * 100
-// K = K_prev * 2/3 + RSV / 3,  D = D_prev * 2/3 + K / 3, starting from 50.
-export function kdSeries(bars, n = 9) {
-  const K = new Array(bars.length).fill(null);
-  const D = new Array(bars.length).fill(null);
-  let k = 50;
-  let d = 50;
-  for (let i = 0; i < bars.length; i++) {
-    if (i < n - 1) continue;
+// Stochastic KD. RSV = (C - lowest low of n) / (highest high of n - lowest low of n) * 100
+//  style 'tw' (Taiwan / Asia brokers, e.g. 9,3,3): K = K_prev*(m1-1)/m1 + RSV/m1, D likewise from K, seeded at 50.
+//  style 'us' (US "slow stochastic", e.g. 14,3,3): K = SMA(RSV, m1), D = SMA(K, m2).
+export function kdSeries(bars, n = 9, m1 = 3, m2 = 3, style = 'tw') {
+  const len = bars.length;
+  const K = new Array(len).fill(null);
+  const D = new Array(len).fill(null);
+  const rsv = new Array(len).fill(null);
+  for (let i = n - 1; i < len; i++) {
     let hi = -Infinity;
     let lo = Infinity;
     for (let j = i - n + 1; j <= i; j++) {
       hi = Math.max(hi, bars[j].h);
       lo = Math.min(lo, bars[j].l);
     }
-    const rsv = hi === lo ? 50 : ((bars[i].c - lo) / (hi - lo)) * 100;
-    k = (k * 2) / 3 + rsv / 3;
-    d = (d * 2) / 3 + k / 3;
+    rsv[i] = hi === lo ? 50 : ((bars[i].c - lo) / (hi - lo)) * 100;
+  }
+  if (style === 'us') {
+    for (let i = n - 1 + m1 - 1; i < len; i++) {
+      let sum = 0;
+      for (let j = i - m1 + 1; j <= i; j++) sum += rsv[j];
+      K[i] = sum / m1;
+    }
+    for (let i = n - 1 + m1 - 1 + m2 - 1; i < len; i++) {
+      let sum = 0;
+      for (let j = i - m2 + 1; j <= i; j++) sum += K[j];
+      D[i] = sum / m2;
+    }
+    return { K, D };
+  }
+  let k = 50;
+  let d = 50;
+  for (let i = n - 1; i < len; i++) {
+    k = (k * (m1 - 1)) / m1 + rsv[i] / m1;
+    d = (d * (m2 - 1)) / m2 + k / m2;
     K[i] = k;
     D[i] = d;
   }

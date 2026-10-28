@@ -152,3 +152,29 @@ test('daily bars count as ready only after 01:00 New York on the same date', () 
   assert.equal(barsReadyToday(Date.UTC(2026, 9, 28, 4, 30), market), false); // 00:30 NY
   assert.equal(barsReadyToday(Date.UTC(2026, 9, 27, 20, 0), market), false); // yesterday
 });
+
+test('KD 14,3,3 uses the US slow stochastic and labels show non-default params', () => {
+  const bars = Array.from({ length: 60 }, (_, i) => {
+    const c = 100 + Math.sin(i / 4) * 10;
+    return { t: `d${i}`, o: c, h: c + 1, l: c - 1, c, v: 1 };
+  });
+  const us = kdSeries(bars, 14, 3, 3, 'us');
+  assert.equal(us.K[14], null); // needs 14 + 3 - 1 bars
+  assert.ok(us.K[15] != null && us.D[17] != null && us.D[16] == null);
+  const c = sanitizeCondition({ type: 'kd', op: 'golden', kdp: '14-3-3' });
+  assert.equal(describeCondition(c), 'KD(14,3,3) 黃金交叉');
+  assert.equal(describeCondition(c, 'en'), 'KD(14,3,3) golden cross');
+  assert.equal(sanitizeCondition({ type: 'kd', op: 'golden', kdp: 'bogus' }).kdp, '9-3-3');
+  const r = evaluateAlert({ logic: 'all', conditions: [c] }, makeContext(bars, null), 'en');
+  assert.match(r.results[0].now, /^K \d/);
+});
+
+test('bilingual errors from sanitize', () => {
+  try {
+    sanitizeCondition({ type: 'rsi', op: 'below', value: 500 });
+    assert.fail('should throw');
+  } catch (err) {
+    assert.equal(err.message, 'RSI 數值需介於 1 到 99');
+    assert.equal(err.en, 'RSI value must be between 1 and 99');
+  }
+});

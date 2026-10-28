@@ -54,13 +54,26 @@
 | `TELEGRAM_BOT_TOKEN` | Telegram 通知 | Telegram 搜尋 @BotFather → `/newbot` → 照指示取名 → 拿到 token | 選用 |
 | `RESEND_API_KEY`、`EMAIL_FROM` | Email 通知 | [resend.com](https://resend.com)；需要驗證自己的網域，`EMAIL_FROM` 例如 `股票提醒 <alert@你的網域>` | 選用 |
 
+| `TURNSTILE_SITE_KEY`（Secret 或一般變數皆可）、`TURNSTILE_SECRET` | 防機器人驗證（建立帳號、找回帳號時） | Cloudflare 後台 →「Turnstile」→「Add widget」，網域填 `你的帳號.workers.dev`，模式選 Managed；建立後會給 Site Key 和 Secret Key | 公開給大家用之前建議設定 |
+
 Discord 不需要任何設定，用戶自己貼 Webhook 網址即可。
+設定好 Email 之後，用戶在登入畫面可以用「忘記帳號代碼？」寄找回連結（會換一組新代碼）。
 
 存檔後打開 `你的網址/setup`，確認每一項都打勾。Telegram 機器人會自動設定好，不用另外操作。
 
 > VAPID 金鑰設定後不要更換，否則已開啟推播的用戶需要重新開啟。
 
 ---
+
+## 語言
+
+介面和通知有繁體中文與英文。第一次打開時依手機語言自動選擇，用戶可在「通知設定」或首頁右上角切換；通知內容會跟著用戶選的語言。
+
+## 防濫用
+
+- 每個 IP 每小時最多建立 5 個帳號、15 分鐘內最多 20 次登入嘗試、每小時最多 5 封找回信
+- 每個帳號每分鐘最多 60 次搜尋、120 次修改
+- 設定 Turnstile 後，建立帳號和找回帳號需要通過驗證
 
 ## 用戶怎麼用
 

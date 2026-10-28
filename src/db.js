@@ -9,6 +9,7 @@ const SCHEMA = [
     quiet_on INTEGER NOT NULL DEFAULT 0,
     quiet_start INTEGER NOT NULL DEFAULT 60,
     quiet_end INTEGER NOT NULL DEFAULT 420,
+    lang TEXT NOT NULL DEFAULT 'zh',
     created_at INTEGER NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS watchlist (
@@ -86,13 +87,21 @@ const SCHEMA = [
     data TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS rate (
+    key TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    reset_at INTEGER NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
   )`,
 ];
 
-const MIGRATIONS = ['ALTER TABLE alerts ADD COLUMN last_session TEXT'];
+const MIGRATIONS = [
+  'ALTER TABLE alerts ADD COLUMN last_session TEXT',
+  "ALTER TABLE users ADD COLUMN lang TEXT NOT NULL DEFAULT 'zh'",
+];
 
 let schemaReady = false;
 

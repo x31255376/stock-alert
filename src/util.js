@@ -7,15 +7,26 @@ export function json(data, status = 200, headers = {}) {
   });
 }
 
+// Errors shown to the user carry a Chinese and an English message; the API picks one per request.
 export class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
+  constructor(status, zh, en) {
+    super(zh);
     this.status = status;
+    this.en = en || zh;
   }
 }
 
-export function bad(message) {
-  return new HttpError(400, message);
+export function bad(zh, en) {
+  return new HttpError(400, zh, en);
+}
+
+// 'en' or 'zh' (Traditional Chinese).
+export function pickLang(value) {
+  return String(value || '').toLowerCase().startsWith('en') ? 'en' : 'zh';
+}
+
+export function tr(lang, zh, en) {
+  return lang === 'en' ? en : zh;
 }
 
 const CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'; // Crockford base32, no I L O U

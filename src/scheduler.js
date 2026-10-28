@@ -28,8 +28,8 @@ function detailLine(r) {
   return r.results.map((x) => x.now).filter((v, i, arr) => arr.indexOf(v) === i).join(' · ');
 }
 
-function metLine(r) {
-  return r.results.filter((x) => x.met).map((x) => x.label).join('、');
+function metLine(r, lang) {
+  return r.results.filter((x) => x.met).map((x) => x.label).join(lang === 'en' ? ', ' : '、');
 }
 
 function triggerEvent(db, a, title, body, now) {
@@ -48,7 +48,7 @@ function nearEvent(db, a, title, r, detail, now) {
       `INSERT INTO events (user_id, alert_id, symbol, kind, title, body, delivery, created_at)
        VALUES (?, ?, ?, 'near', ?, ?, 'none', ?)`
     )
-    .bind(a.user_id, a.id, a.symbol, title, `還差：${pending.join('、')}\n${detail}`, now);
+    .bind(a.user_id, a.id, a.symbol, title, `${a.lang === 'en' ? 'Still needed: ' : '還差：'}${pending.join(a.lang === 'en' ? ', ' : '、')}\n${detail}`, now);
 }
 
 export function packBars(bars) {
@@ -80,7 +80,7 @@ export async function runTick(env, now = Date.now()) {
 
   // ---- 1. which alerts / symbols matter right now ----
   const { results: rawAlerts } = await db
-    .prepare('SELECT a.*, u.tz AS user_tz FROM alerts a JOIN users u ON u.id = a.user_id WHERE a.active = 1')
+    .prepare('SELECT a.*, u.tz AS user_tz, u.lang AS lang FROM alerts a JOIN users u ON u.id = a.user_id WHERE a.active = 1')
     .all();
   const alertRows = rawAlerts.map((row) => {
     const conditions = parseJson(row.conditions, []);
@@ -189,7 +189,7 @@ export async function runTick(env, now = Date.now()) {
       const ctx = liveCtx.get(a.symbol);
       const quote = freshQuotes.get(a.symbol);
       summary.evaluated++;
-      const r = evaluateAlert(a, ctx);
+      const r = evaluateAlert(a, ctx, a.lang);
       const detail = detailLine(r);
       let fire = false;
       if (r.triggered) {
@@ -202,11 +202,19 @@ export async function runTick(env, now = Date.now()) {
       if (fire) {
         summary.triggered++;
         writes.push(
-          triggerEvent(db, a, `【已觸發】${a.symbol} ${fmtPrice(quote.price)}（${fmtPct(quote.changePct)}）`, `${metLine(r)}\n${detail}\n${fmtUserTime(now, a.user_tz)}`, now),
+          triggerEvent(
+            db,
+            a,
+            a.lang === 'en'
+              ? `[Triggered] ${a.symbol} ${fmtPrice(quote.price)} (${fmtPct(quote.changePct)})`
+              : `【已觸發】${a.symbol} ${fmtPrice(quote.price)}（${fmtPct(quote.changePct)}）`,
+            `${metLine(r, a.lang)}\n${detail}\n${fmtUserTime(now, a.user_tz)}`,
+            now
+          ),
           db.prepare('UPDATE alerts SET last_triggered_at = ?, last_trigger_day = ?, active = ? WHERE id = ?').bind(now, market.date, a.frequency === 'once' ? 0 : 1, a.id)
         );
       } else if (r.near && a.last_near_day !== market.date && a.last_trigger_day !== market.date) {
-        writes.push(nearEvent(db, a, `${a.symbol} 接近觸發`, r, detail, now), db.prepare('UPDATE alerts SET last_near_day = ? WHERE id = ?').bind(market.date, a.id));
+        writes.push(nearEvent(db, a, a.lang === 'en' ? `${a.symbol} close to triggering` : `${a.symbol} 接近觸發`, r, detail, now), db.prepare('UPDATE alerts SET last_near_day = ? WHERE id = ?').bind(market.date, a.id));
       }
       writes.push(db.prepare('UPDATE alerts SET status = ?, status_detail = ?, checked_at = ? WHERE id = ?').bind(status, detail, now, a.id));
     }
@@ -223,19 +231,25 @@ export async function runTick(env, now = Date.now()) {
       const session = ctx.bars[ctx.n - 1].t;
       if (a.last_session === session) continue;
       summary.evaluated++;
-      const r = evaluateAlert(a, ctx);
+      const r = evaluateAlert(a, ctx, a.lang);
       const day = session.slice(5).replace('-', '/');
-      const detail = `${day} 收盤：${detailLine(r)}`;
+      const detail = a.lang === 'en' ? `${day} close: ${detailLine(r)}` : `${day} 收盤：${detailLine(r)}`;
       const status = r.triggered ? 'triggered' : r.near ? 'near' : 'watching';
       if (r.triggered) {
         summary.triggered++;
-        const priceLine = `${fmtPrice(ctx.price)}（${fmtPct(ctx.changePct)}）`;
+        const priceLine = a.lang === 'en' ? `${fmtPrice(ctx.price)} (${fmtPct(ctx.changePct)})` : `${fmtPrice(ctx.price)}（${fmtPct(ctx.changePct)}）`;
         writes.push(
-          triggerEvent(db, a, `【收盤確認】${a.symbol} ${day} 收 ${priceLine}`, `${metLine(r)}\n${detailLine(r)}`, now),
+          triggerEvent(
+            db,
+            a,
+            a.lang === 'en' ? `[Close confirmed] ${a.symbol} ${day} close ${priceLine}` : `【收盤確認】${a.symbol} ${day} 收 ${priceLine}`,
+            `${metLine(r, a.lang)}\n${detailLine(r)}`,
+            now
+          ),
           db.prepare('UPDATE alerts SET last_triggered_at = ?, last_trigger_day = ?, active = ? WHERE id = ?').bind(now, market.date, a.frequency === 'once' ? 0 : 1, a.id)
         );
       } else if (r.near) {
-        writes.push(nearEvent(db, a, `${a.symbol} 接近觸發（${day} 收盤）`, r, detailLine(r), now));
+        writes.push(nearEvent(db, a, a.lang === 'en' ? `${a.symbol} close to triggering (${day} close)` : `${a.symbol} 接近觸發（${day} 收盤）`, r, detailLine(r), now));
       }
       writes.push(
         db
@@ -258,6 +272,7 @@ export async function runTick(env, now = Date.now()) {
     await db.batch([
       db.prepare('DELETE FROM events WHERE created_at < ?').bind(now - 90 * 86400000),
       db.prepare('DELETE FROM link_codes WHERE expires_at < ?').bind(now),
+      db.prepare('DELETE FROM rate WHERE reset_at < ?').bind(now),
       db.prepare("DELETE FROM meta WHERE key LIKE 'td_credits:%' AND key < ?").bind(`td_credits:${new Date(now - 3 * 86400000).toISOString().slice(0, 10)}`),
       db.prepare('DELETE FROM bars WHERE symbol NOT IN (SELECT symbol FROM alerts WHERE active = 1) AND updated_at < ?').bind(now - 7 * 86400000),
       db
@@ -326,8 +341,11 @@ async function deliverPending(env, now, outbound) {
       events.length === 1
         ? { title: events[0].title, body: events[0].body, url: '/#/history', tag: `alert-${events[0].alert_id}` }
         : {
-            title: `【${events.length} 則提醒】${[...new Set(events.map((e) => e.symbol))].join('、')}`,
-            body: events.map((e) => e.title.replace(/^【[^】]+】/, '')).join('\n'),
+            title:
+              user.lang === 'en'
+                ? `[${events.length} alerts] ${[...new Set(events.map((e) => e.symbol))].join(', ')}`
+                : `【${events.length} 則提醒】${[...new Set(events.map((e) => e.symbol))].join('、')}`,
+            body: events.map((e) => e.title.replace(/^(【[^】]+】|\[[^\]]+\])\s*/, '')).join('\n'),
             url: '/#/history',
             tag: 'digest',
           };
