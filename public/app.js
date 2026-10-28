@@ -419,13 +419,18 @@ async function runSearch(q) {
   }
   box.innerHTML = '<div class="empty">搜尋中…</div>';
   try {
-    const { results } = await api(`/api/search?q=${encodeURIComponent(q)}`);
+    let { results } = await api(`/api/search?q=${encodeURIComponent(q)}`);
     if (!document.getElementById('search-results')) return;
+    // Search can miss some listings: let a typed ticker be added directly (the server checks it exists).
+    const typed = q.trim().toUpperCase();
+    if (/^[A-Z][A-Z0-9.\-]{0,9}$/.test(typed) && !results.some((r) => r.symbol === typed)) {
+      results = [{ symbol: typed, name: '直接加入這個代號', type: '' }, ...results];
+    }
     box.innerHTML = results.length
       ? results
           .map(
             (r) =>
-              `<button class="result" data-act="pick-symbol" data-symbol="${esc(r.symbol)}" data-name="${esc(r.name)}"><b>${esc(r.symbol)}</b><span>${esc(r.name)}</span></button>`
+              `<button class="result" data-act="pick-symbol" data-symbol="${esc(r.symbol)}" data-name="${esc(r.name)}"><b>${esc(r.symbol)}</b><span>${r.type ? `<em class="type">${esc(r.type)}</em>` : ''}${esc(r.name)}</span></button>`
           )
           .join('')
       : '<div class="empty">找不到符合的美股</div>';
@@ -439,6 +444,7 @@ function closeSheet() {
 }
 
 async function pickSymbol(symbol, name) {
+  if (name === '直接加入這個代號') name = symbol;
   const sheet = document.querySelector('.sheet-backdrop');
   const mode = sheet?.dataset.mode;
   closeSheet();

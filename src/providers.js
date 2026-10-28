@@ -87,13 +87,42 @@ export async function searchSymbols(env, query) {
   }
   const url = `https://finnhub.io/api/v1/search?q=${encodeURIComponent(q)}&exchange=US&token=${env.FINNHUB_KEY}`;
   const data = await getJson(url);
+  const up = q.toUpperCase();
   const seen = new Set();
+  // Keep everything listed in the US (stocks, ETFs, ADRs, preferreds, funds, warrants…),
+  // including share classes such as BRK.B. Exact and prefix ticker matches come first.
   return (data.result || [])
-    .filter((r) => r.symbol && !r.symbol.includes('.') && /^[A-Z][A-Z0-9-]{0,9}$/.test(r.symbol))
-    .filter((r) => !r.type || ['Common Stock', 'ETP', 'ADR', 'REIT'].includes(r.type))
+    .map((r) => ({ symbol: String(r.symbol || r.displaySymbol || '').toUpperCase(), name: r.description || '', type: r.type || '' }))
+    .filter((r) => /^[A-Z][A-Z0-9.\-]{0,9}$/.test(r.symbol))
     .filter((r) => (seen.has(r.symbol) ? false : seen.add(r.symbol)))
-    .slice(0, 12)
-    .map((r) => ({ symbol: r.symbol, name: titleCase(r.description || r.symbol) }));
+    .map((r, i) => ({ ...r, rank: r.symbol === up ? 0 : r.symbol.startsWith(up) ? 1 : 2, i }))
+    .sort((a, b) => a.rank - b.rank || a.symbol.length - b.symbol.length || a.i - b.i)
+    .slice(0, 20)
+    .map((r) => ({ symbol: r.symbol, name: titleCase(r.name || r.symbol), type: typeLabel(r.type) }));
+}
+
+const TYPE_LABELS = {
+  'Common Stock': '',
+  ETP: 'ETF',
+  ADR: 'ADR',
+  'NY Reg Shrs': 'ADR',
+  GDR: 'GDR',
+  REIT: 'REIT',
+  Preference: '特別股',
+  'Equity WRT': '權證',
+  Right: '認購權',
+  Unit: '單位',
+  'Closed-End Fund': '封閉式基金',
+  'Open-End Fund': '基金',
+  MLP: 'MLP',
+  'Ltd Part': '有限合夥',
+  'Royalty Trst': '信託',
+  'Tracking Stk': '追蹤股',
+};
+
+function typeLabel(type) {
+  if (type in TYPE_LABELS) return TYPE_LABELS[type];
+  return type || '';
 }
 
 function titleCase(s) {
