@@ -95,12 +95,17 @@ async function rateLimit(db, name, subject, now) {
   if (row && row.count > max) throw new HttpError(429, '操作太頻繁了，請稍後再試', 'Too many requests. Please wait a moment and try again.');
 }
 
+// Keys pasted on a phone sometimes get autocorrected ("0x" → "0×") or pick up spaces.
+function cleanKey(value) {
+  return String(value || '').trim().replace(/\u00d7/g, 'x');
+}
+
 // Cloudflare Turnstile (bot check). Only enforced when TURNSTILE_SECRET is set.
 async function checkTurnstile(env, request, token) {
   if (!env.TURNSTILE_SECRET) return;
   if (!token) throw bad('請先完成機器人驗證', 'Please complete the verification first');
   const form = new FormData();
-  form.append('secret', env.TURNSTILE_SECRET);
+  form.append('secret', cleanKey(env.TURNSTILE_SECRET));
   form.append('response', String(token));
   form.append('remoteip', clientIp(request));
   const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
@@ -142,7 +147,7 @@ async function route(request, env, ctx, url, lang) {
       channels,
       vapidPublicKey: channels.webpush ? env.VAPID_PUBLIC_KEY : null,
       telegramBot,
-      turnstileSiteKey: env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY ? env.TURNSTILE_SITE_KEY : null,
+      turnstileSiteKey: env.TURNSTILE_SECRET && env.TURNSTILE_SITE_KEY ? cleanKey(env.TURNSTILE_SITE_KEY) : null,
       recovery: channels.email,
       market: marketInfo(env, now),
     });
