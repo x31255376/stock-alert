@@ -28,8 +28,11 @@
         <div id="keys" class="stack hidden">
           <label class="label" for="pub">VAPID_PUBLIC_KEY</label>
           <textarea id="pub" class="input" readonly></textarea>
+          <button class="btn secondary" type="button" data-copy="pub">複製 VAPID_PUBLIC_KEY</button>
           <label class="label" for="priv">VAPID_PRIVATE_KEY（請保密）</label>
           <textarea id="priv" class="input" readonly></textarea>
+          <button class="btn secondary" type="button" data-copy="priv">複製 VAPID_PRIVATE_KEY</button>
+          <small class="muted">請用複製按鈕，不要手動選取文字，避免少複製一段。</small>
         </div>
       </div>
       <a class="btn secondary" href="/">回到股票提醒</a>
@@ -45,6 +48,15 @@
       document.getElementById('pub').value = b64url(raw);
       document.getElementById('priv').value = jwk.d;
       document.getElementById('keys').classList.remove('hidden');
+    });
+
+    document.addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-copy]');
+      if (!b) return;
+      await navigator.clipboard.writeText(document.getElementById(b.dataset.copy).value);
+      const old = b.textContent;
+      b.textContent = '已複製 ✓';
+      setTimeout(() => (b.textContent = old), 1500);
     });
 
     (async () => {

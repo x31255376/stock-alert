@@ -1182,6 +1182,15 @@ async function enablePush() {
   const reg = await navigator.serviceWorker.register('/sw.js');
   await navigator.serviceWorker.ready;
   let sub = await reg.pushManager.getSubscription();
+  // A subscription made with an older server key can no longer receive pushes: replace it.
+  if (sub && sub.options && sub.options.applicationServerKey) {
+    const current = urlBase64ToUint8Array(state.config.vapidPublicKey);
+    const existing = new Uint8Array(sub.options.applicationServerKey);
+    if (existing.length !== current.length || existing.some((b, i) => b !== current[i])) {
+      await sub.unsubscribe().catch(() => {});
+      sub = null;
+    }
+  }
   if (!sub) {
     sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(state.config.vapidPublicKey) });
   }
