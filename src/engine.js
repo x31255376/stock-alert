@@ -9,6 +9,9 @@ export const MA_PAIRS = [
   [50, 200],
 ];
 export const MAX_CONDITIONS = 6;
+
+// Conditions that can be checked on the close only ("收盤確認") instead of live during the session.
+export const MODE_TYPES = ['kd', 'ma_cross', 'price_ma'];
 export const FREQUENCIES = ['once', 'daily', 'hourly'];
 
 const OPS = {
@@ -42,22 +45,47 @@ export function sanitizeCondition(raw) {
       return { type, op, value: num(raw.value, 1, 99, 'RSI 數值') };
     case 'ma_cross': {
       const pair = MA_PAIRS.find(([f, s]) => f === Number(raw.fast) && s === Number(raw.slow)) || [20, 60];
-      return { type, op, fast: pair[0], slow: pair[1] };
+      return { type, op, fast: pair[0], slow: pair[1], mode: cleanMode(raw.mode) };
     }
     case 'price_ma': {
       const period = MA_PERIODS.includes(Number(raw.period)) ? Number(raw.period) : 20;
-      return { type, op, period };
+      return { type, op, period, mode: cleanMode(raw.mode) };
     }
     case 'kd':
-      if (op === 'k_below' || op === 'k_above') return { type, op, value: num(raw.value, 1, 99, 'K 值') };
-      return { type, op };
+      if (op === 'k_below' || op === 'k_above') return { type, op, value: num(raw.value, 1, 99, 'K 值'), mode: cleanMode(raw.mode) };
+      return { type, op, mode: cleanMode(raw.mode) };
     case 'volume':
       return { type, op: 'above', value: num(raw.value, 1, 50, '倍數') };
   }
   throw new Error('條件格式錯誤');
 }
 
+function cleanMode(mode) {
+  return mode === 'intraday' ? 'intraday' : 'close';
+}
+
+// Volume is always checked on the last completed session (live intraday volume from the free
+// data plans is partial). KD / MA conditions default to the close unless set to 'intraday'.
+export function isCloseCondition(c) {
+  return c.type === 'volume' || (MODE_TYPES.includes(c.type) && c.mode !== 'intraday');
+}
+
+// An alert with any close-only condition is evaluated once per session, on completed daily bars.
+export function alertTiming(conditions) {
+  return conditions.some(isCloseCondition) ? 'close' : 'intraday';
+}
+
+// Price / change conditions work from the live quote alone; everything else needs daily bars.
+export function needsBars(conditions) {
+  return conditions.some((c) => c.type !== 'price' && c.type !== 'change');
+}
+
 export function describeCondition(c) {
+  const label = baseLabel(c);
+  return MODE_TYPES.includes(c.type) && c.mode === 'intraday' ? `${label}（盤中）` : label;
+}
+
+function baseLabel(c) {
   switch (c.type) {
     case 'price':
       return {
@@ -67,7 +95,7 @@ export function describeCondition(c) {
         cross_below: `價格跌破 ${c.value}`,
       }[c.op];
     case 'change':
-      return c.op === 'up' ? `今日漲幅 ≥ ${c.value}%` : `今日跌幅 ≥ ${c.value}%`;
+      return c.op === 'up' ? `漲幅 ≥ ${c.value}%` : `跌幅 ≥ ${c.value}%`;
     case 'rsi':
       return c.op === 'below' ? `RSI(14) < ${c.value}` : `RSI(14) > ${c.value}`;
     case 'ma_cross':
@@ -87,7 +115,7 @@ export function describeCondition(c) {
         k_above: `K 值 > ${c.value}`,
       }[c.op];
     case 'volume':
-      return `今日成交量 > 均量 ${c.value} 倍`;
+      return `前一交易日成交量 > 均量 ${c.value} 倍`;
   }
   return '條件';
 }

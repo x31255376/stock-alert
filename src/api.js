@@ -14,7 +14,7 @@ import {
 } from './util.js';
 import { marketState, nyParts } from './market.js';
 import { fetchQuote, searchSymbols, isDemo, hasBarSource } from './providers.js';
-import { sanitizeCondition, describeCondition, MAX_CONDITIONS, FREQUENCIES } from './engine.js';
+import { sanitizeCondition, describeCondition, alertTiming, MAX_CONDITIONS, FREQUENCIES } from './engine.js';
 import {
   availableChannels,
   ensureTelegramWebhook,
@@ -246,10 +246,12 @@ async function route(request, env, ctx, url) {
           `UPDATE alerts SET logic = ?, conditions = ?, channels = ?, frequency = ?, active = ?,
              status = CASE WHEN ? THEN 'watching' ELSE status END,
              last_trigger_day = CASE WHEN ? THEN NULL ELSE last_trigger_day END,
-             last_near_day = CASE WHEN ? THEN NULL ELSE last_near_day END
+             last_near_day = CASE WHEN ? THEN NULL ELSE last_near_day END,
+             last_session = CASE WHEN ? THEN NULL ELSE last_session END,
+             checked_at = CASE WHEN ? THEN NULL ELSE checked_at END
            WHERE id = ? RETURNING *`
         )
-        .bind(fields.logic, JSON.stringify(fields.conditions), fields.channels, fields.frequency, active, changed ? 1 : 0, changed ? 1 : 0, changed ? 1 : 0, id)
+        .bind(fields.logic, JSON.stringify(fields.conditions), fields.channels, fields.frequency, active, ...Array(5).fill(changed ? 1 : 0), id)
         .first();
       return json({ alert: alertResponse(updated) });
     }
@@ -409,6 +411,7 @@ export function alertResponse(row) {
     logic: row.logic,
     conditions,
     labels: conditions.map(describeCondition),
+    timing: alertTiming(conditions),
     channels: parseJson(row.channels, []),
     frequency: row.frequency,
     active: Boolean(row.active),

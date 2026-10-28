@@ -2,10 +2,10 @@
 // Written to stay inside the Workers Free plan limits per run: 50 outbound requests, 50 D1 queries
 // (a db.batch counts as one), 10 ms CPU.
 import { ensureSchema, getMeta, parseJson, upsertQuoteStmt, quoteFromRow } from './db.js';
-import { marketState } from './market.js';
+import { marketState, nyParts } from './market.js';
 import { fetchQuote, fetchBars, hasBarSource, isDemo, twelveDataCreditsLeft, TD_DAILY_CAP } from './providers.js';
 import { mergeLiveBar } from './indicators.js';
-import { makeContext, evaluateAlert } from './engine.js';
+import { makeContext, evaluateAlert, alertTiming, needsBars } from './engine.js';
 import { availableChannels, ensureTelegramWebhook, deliverToChannels } from './notify.js';
 import { fmtPrice, fmtPct, fmtUserTime, minutesInZone } from './util.js';
 
@@ -13,6 +13,43 @@ const QUOTES_PER_TICK = 20; // Finnhub free: 60/min, leave room for the app's ow
 const BARS_PER_TICK = 5; // Twelve Data free: 8/min
 const OUTBOUND_BUDGET = 46; // Workers Free: 50 subrequests per run
 const PENDING_PER_TICK = 25;
+
+// Twelve Data publishes the previous session's full volume after midnight New York time.
+const DAILY_READY_MIN = 60; // 01:00 New York
+
+// True when the stored bars were refreshed today (New York date) after the daily data was ready.
+export function barsReadyToday(updatedAt, market) {
+  if (!updatedAt) return false;
+  const p = nyParts(updatedAt);
+  return p.date === market.date && p.minutes >= DAILY_READY_MIN;
+}
+
+function detailLine(r) {
+  return r.results.map((x) => x.now).filter((v, i, arr) => arr.indexOf(v) === i).join(' · ');
+}
+
+function metLine(r) {
+  return r.results.filter((x) => x.met).map((x) => x.label).join('、');
+}
+
+function triggerEvent(db, a, title, body, now) {
+  return db
+    .prepare(
+      `INSERT INTO events (user_id, alert_id, symbol, kind, title, body, channels, delivery, created_at)
+       VALUES (?, ?, ?, 'triggered', ?, ?, ?, 'pending', ?)`
+    )
+    .bind(a.user_id, a.id, a.symbol, title, body, a.channels, now);
+}
+
+function nearEvent(db, a, title, r, detail, now) {
+  const pending = r.results.filter((x) => !x.met).map((x) => x.label);
+  return db
+    .prepare(
+      `INSERT INTO events (user_id, alert_id, symbol, kind, title, body, delivery, created_at)
+       VALUES (?, ?, ?, 'near', ?, ?, 'none', ?)`
+    )
+    .bind(a.user_id, a.id, a.symbol, title, `還差：${pending.join('、')}\n${detail}`, now);
+}
 
 export function packBars(bars) {
   return JSON.stringify(bars.map((b) => [b.t, b.o, b.h, b.l, b.c, b.v]));
@@ -41,8 +78,14 @@ export async function runTick(env, now = Date.now()) {
 
   const summary = { market: market.open ? 'open' : 'closed', quotes: 0, bars: 0, evaluated: 0, triggered: 0, delivered: 0 };
 
-  // ---- 1. which symbols matter right now ----
-  const { results: alertRows } = await db.prepare('SELECT * FROM alerts WHERE active = 1').all();
+  // ---- 1. which alerts / symbols matter right now ----
+  const { results: rawAlerts } = await db
+    .prepare('SELECT a.*, u.tz AS user_tz FROM alerts a JOIN users u ON u.id = a.user_id WHERE a.active = 1')
+    .all();
+  const alertRows = rawAlerts.map((row) => {
+    const conditions = parseJson(row.conditions, []);
+    return { ...row, conditions, timing: alertTiming(conditions), bars: needsBars(conditions) };
+  });
   const alertSymbols = [...new Set(alertRows.map((a) => a.symbol))];
 
   if (alertSymbols.length) {
@@ -55,24 +98,26 @@ export async function runTick(env, now = Date.now()) {
     const barsUpdated = new Map(barMetaRes.results.map((r) => [r.symbol, r.updated_at]));
     const writes = [];
 
-    // ---- 2. bars (indicators) ----
+    // ---- 2. daily bars ----
+    // Every symbol with indicator alerts is refreshed once a day after 01:00 New York time, when the
+    // previous session's full (consolidated) volume is available. Symbols with live-indicator alerts
+    // are also refreshed during the session.
+    const barSymbols = new Set(alertRows.filter((a) => a.bars).map((a) => a.symbol));
+    const liveIndicatorSymbols = new Set(alertRows.filter((a) => a.bars && a.timing === 'intraday').map((a) => a.symbol));
     const barsFetched = new Map();
-    if (hasBarSource(env)) {
-      const refreshMin = Math.max(15, Math.ceil((alertSymbols.length * 390) / (TD_DAILY_CAP - 60)));
-      const needsBars = alertSymbols
+    if (hasBarSource(env) && barSymbols.size) {
+      const refreshMin = Math.max(15, Math.ceil((liveIndicatorSymbols.size * 390) / (TD_DAILY_CAP - 60 - barSymbols.size)));
+      const needs = [...barSymbols]
         .filter((s) => {
           const at = barsUpdated.get(s);
           if (!at) return true; // never fetched
-          const ageMin = (now - at) / 60000;
-          if (market.open) return ageMin >= refreshMin;
-          // After the close, one final refresh to capture the full day's bar.
-          if (market.sinceClose != null && market.sinceClose >= 20) return ageMin > market.sinceClose - 20;
-          return false;
+          if (!barsReadyToday(at, market) && market.minutes >= DAILY_READY_MIN) return true;
+          return market.open && liveIndicatorSymbols.has(s) && (now - at) / 60000 >= refreshMin;
         })
         .sort((a, b) => (barsUpdated.get(a) || 0) - (barsUpdated.get(b) || 0));
       let credits = null;
-      if (needsBars.length && !isDemo(env)) credits = await twelveDataCreditsLeft(env, now);
-      const batch = needsBars.slice(0, Math.min(BARS_PER_TICK, credits ? credits.left : Infinity, outbound));
+      if (needs.length && !isDemo(env)) credits = await twelveDataCreditsLeft(env, now);
+      const batch = needs.slice(0, Math.min(BARS_PER_TICK, credits ? credits.left : Infinity, outbound));
       outbound -= batch.length;
       if (credits && batch.length) {
         writes.push(
@@ -85,6 +130,7 @@ export async function runTick(env, now = Date.now()) {
       fetched.forEach((r, i) => {
         if (r.status === 'fulfilled' && r.value && r.value.length) {
           barsFetched.set(batch[i], r.value);
+          barsUpdated.set(batch[i], now);
           writes.push(
             db
               .prepare('INSERT INTO bars (symbol, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at')
@@ -97,10 +143,11 @@ export async function runTick(env, now = Date.now()) {
       summary.bars = barsFetched.size;
     }
 
-    // ---- 3. live quotes, oldest first (only while the market is open) ----
+    // ---- 3. live quotes, oldest first (only while the market is open, only for live alerts) ----
     const freshQuotes = new Map();
-    if (market.open) {
-      const order = alertSymbols.slice().sort((a, b) => (quoteBySymbol.get(a)?.updated_at || 0) - (quoteBySymbol.get(b)?.updated_at || 0));
+    const liveSymbols = [...new Set(alertRows.filter((a) => a.timing === 'intraday').map((a) => a.symbol))];
+    if (market.open && liveSymbols.length) {
+      const order = liveSymbols.sort((a, b) => (quoteBySymbol.get(a)?.updated_at || 0) - (quoteBySymbol.get(b)?.updated_at || 0));
       const batch = order.slice(0, Math.min(QUOTES_PER_TICK, Math.max(0, outbound - 10)));
       outbound -= batch.length;
       const fetched = await Promise.allSettled(batch.map((s) => fetchQuote(env, s, now)));
@@ -115,95 +162,86 @@ export async function runTick(env, now = Date.now()) {
       summary.quotes = freshQuotes.size;
     }
 
-    // ---- 4. evaluate alerts for symbols with a fresh quote ----
-    if (freshQuotes.size) {
-      const symbols = [...freshQuotes.keys()];
-      const needStored = symbols.filter((s) => !barsFetched.has(s));
-      const stored = new Map();
-      if (needStored.length) {
-        const { results } = await db
-          .prepare(`SELECT symbol, data FROM bars WHERE symbol IN (${needStored.map(() => '?').join(',')})`)
-          .bind(...needStored)
-          .all();
-        for (const r of results) stored.set(r.symbol, unpackBars(r.data));
+    // Which alerts get evaluated this run.
+    const liveDue = alertRows.filter((a) => a.timing === 'intraday' && freshQuotes.has(a.symbol));
+    const closeReady = new Set([...barSymbols].filter((s) => barsReadyToday(barsUpdated.get(s), market)));
+    const closeCandidates = alertRows.filter((a) => a.timing === 'close' && closeReady.has(a.symbol));
+
+    // Load stored bars for the symbols we evaluate but did not just fetch.
+    const wantBars = new Set([...liveDue.filter((a) => a.bars), ...closeCandidates].map((a) => a.symbol));
+    const needStored = [...wantBars].filter((s) => !barsFetched.has(s));
+    const allBars = new Map(barsFetched);
+    if (needStored.length) {
+      const { results } = await db
+        .prepare(`SELECT symbol, data FROM bars WHERE symbol IN (${needStored.map(() => '?').join(',')})`)
+        .bind(...needStored)
+        .all();
+      for (const r of results) allBars.set(r.symbol, unpackBars(r.data));
+    }
+
+    // ---- 4a. live alerts: daily bars + the current price ----
+    const liveCtx = new Map();
+    for (const a of liveDue) {
+      if (!liveCtx.has(a.symbol)) {
+        const quote = freshQuotes.get(a.symbol);
+        liveCtx.set(a.symbol, makeContext(mergeLiveBar(allBars.get(a.symbol) || [], quote, market.date), quote));
       }
-      const userIds = [...new Set(alertRows.filter((a) => freshQuotes.has(a.symbol)).map((a) => a.user_id))];
-      const users = new Map();
-      if (userIds.length) {
-        const { results } = await db
-          .prepare(`SELECT id, tz FROM users WHERE id IN (${userIds.map(() => '?').join(',')})`)
-          .bind(...userIds)
-          .all();
-        for (const u of results) users.set(u.id, u);
+      const ctx = liveCtx.get(a.symbol);
+      const quote = freshQuotes.get(a.symbol);
+      summary.evaluated++;
+      const r = evaluateAlert(a, ctx);
+      const detail = detailLine(r);
+      let fire = false;
+      if (r.triggered) {
+        if (a.frequency === 'once') fire = true;
+        else if (a.frequency === 'hourly') fire = !a.last_triggered_at || now - a.last_triggered_at >= 3600000;
+        else fire = a.last_trigger_day !== market.date;
       }
-
-      const contexts = new Map();
-      for (const s of symbols) {
-        const quote = freshQuotes.get(s);
-        const bars = barsFetched.get(s) || stored.get(s) || [];
-        contexts.set(s, makeContext(mergeLiveBar(bars, quote, market.date), quote));
-      }
-
-      for (const row of alertRows) {
-        const ctx = contexts.get(row.symbol);
-        if (!ctx) continue;
-        summary.evaluated++;
-        const alert = { ...row, conditions: parseJson(row.conditions, []) };
-        const r = evaluateAlert(alert, ctx);
-        const quote = freshQuotes.get(row.symbol);
-        const detail = r.results.map((x) => x.now).filter((v, i, arr) => arr.indexOf(v) === i).join(' · ');
-        let status = r.triggered ? 'triggered' : r.near ? 'near' : 'watching';
-        if (!r.triggered && row.last_trigger_day === market.date) status = 'triggered'; // keep "今日已觸發" for the day
-
-        let fire = false;
-        if (r.triggered) {
-          if (row.frequency === 'once') fire = true;
-          else if (row.frequency === 'hourly') fire = !row.last_triggered_at || now - row.last_triggered_at >= 3600000;
-          else fire = row.last_trigger_day !== market.date;
-        }
-
-        const tz = users.get(row.user_id)?.tz || 'UTC';
-        const priceLine = `${fmtPrice(quote.price)}（${fmtPct(quote.changePct)}）`;
-        if (fire) {
-          summary.triggered++;
-          const metLabels = r.results.filter((x) => x.met).map((x) => x.label);
-          writes.push(
-            db
-              .prepare(
-                `INSERT INTO events (user_id, alert_id, symbol, kind, title, body, channels, delivery, created_at)
-                 VALUES (?, ?, ?, 'triggered', ?, ?, ?, 'pending', ?)`
-              )
-              .bind(
-                row.user_id,
-                row.id,
-                row.symbol,
-                `【已觸發】${row.symbol} ${priceLine}`,
-                `${metLabels.join('、')}\n${detail}\n${fmtUserTime(now, tz)}`,
-                row.channels,
-                now
-              )
-          );
-          writes.push(
-            db
-              .prepare('UPDATE alerts SET last_triggered_at = ?, last_trigger_day = ?, active = ? WHERE id = ?')
-              .bind(now, market.date, row.frequency === 'once' ? 0 : 1, row.id)
-          );
-        } else if (r.near && row.last_near_day !== market.date && row.last_trigger_day !== market.date) {
-          const pending = r.results.filter((x) => !x.met).map((x) => x.label);
-          writes.push(
-            db
-              .prepare(
-                `INSERT INTO events (user_id, alert_id, symbol, kind, title, body, delivery, created_at)
-                 VALUES (?, ?, ?, 'near', ?, ?, 'none', ?)`
-              )
-              .bind(row.user_id, row.id, row.symbol, `${row.symbol} 接近觸發`, `還差：${pending.join('、')}\n${detail}`, now)
-          );
-          writes.push(db.prepare('UPDATE alerts SET last_near_day = ? WHERE id = ?').bind(market.date, row.id));
-        }
+      let status = r.triggered ? 'triggered' : r.near ? 'near' : 'watching';
+      if (!r.triggered && a.last_trigger_day === market.date) status = 'triggered'; // keep "今日已觸發" for the day
+      if (fire) {
+        summary.triggered++;
         writes.push(
-          db.prepare('UPDATE alerts SET status = ?, status_detail = ?, checked_at = ? WHERE id = ?').bind(status, detail, now, row.id)
+          triggerEvent(db, a, `【已觸發】${a.symbol} ${fmtPrice(quote.price)}（${fmtPct(quote.changePct)}）`, `${metLine(r)}\n${detail}\n${fmtUserTime(now, a.user_tz)}`, now),
+          db.prepare('UPDATE alerts SET last_triggered_at = ?, last_trigger_day = ?, active = ? WHERE id = ?').bind(now, market.date, a.frequency === 'once' ? 0 : 1, a.id)
         );
+      } else if (r.near && a.last_near_day !== market.date && a.last_trigger_day !== market.date) {
+        writes.push(nearEvent(db, a, `${a.symbol} 接近觸發`, r, detail, now), db.prepare('UPDATE alerts SET last_near_day = ? WHERE id = ?').bind(market.date, a.id));
       }
+      writes.push(db.prepare('UPDATE alerts SET status = ?, status_detail = ?, checked_at = ? WHERE id = ?').bind(status, detail, now, a.id));
+    }
+
+    // ---- 4b. close-confirmed alerts: once per completed session, on full daily data ----
+    const closeCtx = new Map();
+    for (const a of closeCandidates) {
+      if (!closeCtx.has(a.symbol)) {
+        const completed = (allBars.get(a.symbol) || []).filter((b) => b.t < market.date);
+        closeCtx.set(a.symbol, completed.length ? makeContext(completed, null) : null);
+      }
+      const ctx = closeCtx.get(a.symbol);
+      if (!ctx) continue;
+      const session = ctx.bars[ctx.n - 1].t;
+      if (a.last_session === session) continue;
+      summary.evaluated++;
+      const r = evaluateAlert(a, ctx);
+      const day = session.slice(5).replace('-', '/');
+      const detail = `${day} 收盤：${detailLine(r)}`;
+      const status = r.triggered ? 'triggered' : r.near ? 'near' : 'watching';
+      if (r.triggered) {
+        summary.triggered++;
+        const priceLine = `${fmtPrice(ctx.price)}（${fmtPct(ctx.changePct)}）`;
+        writes.push(
+          triggerEvent(db, a, `【收盤確認】${a.symbol} ${day} 收 ${priceLine}`, `${metLine(r)}\n${detailLine(r)}`, now),
+          db.prepare('UPDATE alerts SET last_triggered_at = ?, last_trigger_day = ?, active = ? WHERE id = ?').bind(now, market.date, a.frequency === 'once' ? 0 : 1, a.id)
+        );
+      } else if (r.near) {
+        writes.push(nearEvent(db, a, `${a.symbol} 接近觸發（${day} 收盤）`, r, detailLine(r), now));
+      }
+      writes.push(
+        db
+          .prepare('UPDATE alerts SET status = ?, status_detail = ?, checked_at = ?, last_session = ? WHERE id = ?')
+          .bind(status, detail, now, session, a.id)
+      );
     }
 
     if (writes.length) await db.batch(writes);
@@ -289,7 +327,7 @@ async function deliverPending(env, now, outbound) {
         ? { title: events[0].title, body: events[0].body, url: '/#/history', tag: `alert-${events[0].alert_id}` }
         : {
             title: `【${events.length} 則提醒】${[...new Set(events.map((e) => e.symbol))].join('、')}`,
-            body: events.map((e) => e.title.replace('【已觸發】', '')).join('\n'),
+            body: events.map((e) => e.title.replace(/^【[^】]+】/, '')).join('\n'),
             url: '/#/history',
             tag: 'digest',
           };

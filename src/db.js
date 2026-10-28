@@ -33,6 +33,7 @@ const SCHEMA = [
     last_triggered_at INTEGER,
     last_trigger_day TEXT,
     last_near_day TEXT,
+    last_session TEXT,
     checked_at INTEGER,
     created_at INTEGER NOT NULL
   )`,
@@ -91,11 +92,19 @@ const SCHEMA = [
   )`,
 ];
 
+const MIGRATIONS = ['ALTER TABLE alerts ADD COLUMN last_session TEXT'];
+
 let schemaReady = false;
 
 export async function ensureSchema(db) {
   if (schemaReady) return;
   await db.batch(SCHEMA.map((sql) => db.prepare(sql)));
+  // Columns added after the first release (fails harmlessly once the column exists).
+  for (const sql of MIGRATIONS) {
+    try {
+      await db.prepare(sql).run();
+    } catch {}
+  }
   schemaReady = true;
 }
 

@@ -93,7 +93,7 @@ test('sanitize rejects bad input and labels are Chinese', () => {
   assert.throws(() => sanitizeCondition({ type: 'rsi', op: 'below', value: 150 }));
   assert.throws(() => sanitizeCondition({ type: 'nope', op: 'x' }));
   assert.equal(describeCondition(sanitizeCondition({ type: 'kd', op: 'golden' })), 'KD 黃金交叉');
-  assert.equal(describeCondition(sanitizeCondition({ type: 'volume', op: 'above', value: 1.5 })), '今日成交量 > 均量 1.5 倍');
+  assert.equal(describeCondition(sanitizeCondition({ type: 'volume', op: 'above', value: 1.5 })), '前一交易日成交量 > 均量 1.5 倍');
 });
 
 test('market hours in New York', () => {
@@ -113,4 +113,42 @@ test('market hours in New York', () => {
 
 test('account code normalization', () => {
   assert.equal(normalizeAccountCode('k7q2-m9xd oiL1'), 'K7Q2M9XD0111');
+});
+
+import { alertTiming, isCloseCondition, needsBars } from '../src/engine.js';
+import { barsReadyToday } from '../src/scheduler.js';
+import { marketState as ms } from '../src/market.js';
+
+test('timing: volume and KD/MA default to close, intraday opt-in', () => {
+  const kd = sanitizeCondition({ type: 'kd', op: 'golden' });
+  const kdLive = sanitizeCondition({ type: 'kd', op: 'golden', mode: 'intraday' });
+  const vol = sanitizeCondition({ type: 'volume', op: 'above', value: 1.5 });
+  const price = sanitizeCondition({ type: 'price', op: 'above', value: 10 });
+  assert.equal(kd.mode, 'close');
+  assert.equal(isCloseCondition(kd), true);
+  assert.equal(isCloseCondition(kdLive), false);
+  assert.equal(alertTiming([price]), 'intraday');
+  assert.equal(alertTiming([price, kdLive]), 'intraday');
+  assert.equal(alertTiming([price, vol]), 'close');
+  assert.equal(needsBars([price]), false);
+  assert.equal(needsBars([kdLive]), true);
+  assert.equal(describeCondition(kdLive), 'KD 黃金交叉（盤中）');
+  assert.equal(describeCondition(vol), '前一交易日成交量 > 均量 1.5 倍');
+});
+
+test('volume uses the last completed session', () => {
+  const bars = Array.from({ length: 22 }, (_, i) => ({ t: `2026-10-${String(i + 1).padStart(2, '0')}`, o: 1, h: 1, l: 1, c: 1, v: i === 20 ? 250 : i === 21 ? 5 : 100 }));
+  const today = '2026-10-22';
+  const completed = bars.filter((b) => b.t < today); // drops the partial "today" bar (v=5)
+  const r = evaluateAlert({ logic: 'all', conditions: [sanitizeCondition({ type: 'volume', op: 'above', value: 2 })] }, makeContext(completed, null));
+  assert.equal(r.triggered, true);
+  assert.equal(r.results[0].now, '成交量 2.50 倍均量');
+});
+
+test('daily bars count as ready only after 01:00 New York on the same date', () => {
+  const now = Date.UTC(2026, 9, 28, 14, 0); // 10:00 NY
+  const market = ms(now);
+  assert.equal(barsReadyToday(Date.UTC(2026, 9, 28, 5, 30), market), true); // 01:30 NY
+  assert.equal(barsReadyToday(Date.UTC(2026, 9, 28, 4, 30), market), false); // 00:30 NY
+  assert.equal(barsReadyToday(Date.UTC(2026, 9, 27, 20, 0), market), false); // yesterday
 });

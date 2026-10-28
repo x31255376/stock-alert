@@ -39,16 +39,17 @@ const TYPES = {
     value: { unit: '美元', step: '0.01' },
     basic: true,
   },
-  change: { label: '今日漲跌幅', ops: [['up', '漲幅達'], ['down', '跌幅達']], value: { unit: '%', step: '0.1', def: 3 }, basic: true },
+  change: { label: '漲跌幅', ops: [['up', '漲幅達'], ['down', '跌幅達']], value: { unit: '%', step: '0.1', def: 3 }, basic: true },
   rsi: { label: 'RSI (14)', ops: [['below', '低於'], ['above', '高於']], value: { unit: '', step: '1', def: 30 } },
-  ma_cross: { label: '均線交叉', ops: [['golden', '黃金交叉（向上）'], ['death', '死亡交叉（向下）']], pair: true },
-  price_ma: { label: '價格 vs 均線', ops: [['cross_above', '站上'], ['cross_below', '跌破'], ['above', '在之上'], ['below', '在之下']], period: true },
+  ma_cross: { label: '均線交叉', ops: [['golden', '黃金交叉（向上）'], ['death', '死亡交叉（向下）']], pair: true, mode: true },
+  price_ma: { label: '價格 vs 均線', ops: [['cross_above', '站上'], ['cross_below', '跌破'], ['above', '在之上'], ['below', '在之下']], period: true, mode: true },
   kd: {
     label: 'KD (9,3,3)',
     ops: [['golden', '黃金交叉'], ['death', '死亡交叉'], ['k_below', 'K 值低於'], ['k_above', 'K 值高於']],
     value: { unit: '', step: '1', def: 20, only: ['k_below', 'k_above'] },
+    mode: true,
   },
-  volume: { label: '今日成交量', ops: [['above', '大於 20 日均量']], value: { unit: '倍', step: '0.1', def: 1.5 } },
+  volume: { label: '成交量（前一交易日）', ops: [['above', '大於 20 日均量']], value: { unit: '倍', step: '0.1', def: 1.5 }, close: true },
 };
 
 const TEMPLATES = [
@@ -127,6 +128,20 @@ function fmtTime(ms) {
   const hm = d.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false });
   if (d.toDateString() === now.toDateString()) return hm;
   return `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+// Local clock time of 01:00 New York, when the previous session's complete data is published.
+function dailyCheckTime() {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    let t = Math.ceil(Date.now() / 900000) * 900000;
+    for (let i = 0; i < 200; i++, t += 900000) {
+      if (fmt.format(new Date(t)) === '01:00') {
+        return new Date(t).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', hour12: false }) + ' 之後';
+      }
+    }
+  } catch {}
+  return '美東時間凌晨 1 點後';
 }
 
 function minutesToTime(m) {
@@ -271,6 +286,10 @@ async function loadHome() {
 function statusInfo(a, market) {
   if (a.status === 'paused') return ['st-paused', '已暫停'];
   if (a.status === 'done') return ['st-done', '已完成'];
+  if (a.timing === 'close') {
+    if (!a.checked) return ['st-waiting', '等待收盤資料'];
+    if (a.status === 'triggered') return ['st-triggered', '收盤已觸發'];
+  }
   if (!a.checked) return ['st-waiting', market.open ? '準備中' : '等待開盤'];
   if (a.status === 'triggered') return ['st-triggered', '今日已觸發'];
   if (a.status === 'near') return ['st-near', '接近觸發'];
@@ -462,6 +481,7 @@ function defaultCondition(type, price) {
     c.slow = 60;
   }
   if (t.period) c.period = 20;
+  if (t.mode) c.mode = 'close';
   return c;
 }
 
@@ -523,6 +543,14 @@ function condHtml(c, i) {
       <select class="input grow2" data-cond="${i}" data-field="op" aria-label="比較方式">${opOpts}</select>
       ${third}
     </div>
+    ${
+      t.mode
+        ? `<div class="cond-line"><select class="input" data-cond="${i}" data-field="mode" aria-label="判斷時機">
+            <option value="close" ${c.mode !== 'intraday' ? 'selected' : ''}>收盤確認（建議，不會假訊號）</option>
+            <option value="intraday" ${c.mode === 'intraday' ? 'selected' : ''}>盤中即時（較快，可能收盤前又反轉）</option>
+          </select></div>`
+        : ''
+    }
   </div>`;
 }
 
@@ -538,6 +566,10 @@ function renderEditorView() {
         )
         .join('')}</div>`
     : `<div class="notice">還沒有設定通知方式，提醒觸發時只會記錄在「提醒紀錄」。<a href="#/settings">去設定通知 ›</a></div>`;
+  const isClose = d.conditions.some((c) => TYPES[c.type].close || (TYPES[c.type].mode && c.mode !== 'intraday'));
+  const timingNote = isClose
+    ? `<div class="notice info"><b>這個提醒用收盤資料判斷</b>每個交易日收盤、完整資料出來後檢查一次（約你當地時間 ${esc(dailyCheckTime())}），所有條件都以那天的收盤價和成交量計算。</div>`
+    : '';
   const indicatorNote = state.config.indicators
     ? ''
     : `<div class="notice info">技術指標（RSI、KD、均線、成交量）需要管理員設定指標資料來源後才能使用，目前可設定價格與漲跌幅。</div>`;
@@ -565,6 +597,7 @@ function renderEditorView() {
       </div>
       ${indicatorNote}
       ${d.conditions.map(condHtml).join('')}
+      ${timingNote}
       ${d.conditions.length < 6 ? '<button class="dashed" type="button" data-act="add-cond">＋ 新增條件</button>' : ''}
       ${
         state.config.indicators
@@ -624,7 +657,7 @@ async function saveAlert() {
     symbol: d.symbol,
     name: d.name,
     logic: d.logic,
-    conditions: d.conditions.map(({ type, op, value, fast, slow, period }) => ({ type, op, value, fast, slow, period })),
+    conditions: d.conditions.map(({ type, op, value, fast, slow, period, mode }) => ({ type, op, value, fast, slow, period, mode })),
     channels: d.channels,
     frequency: d.frequency,
     active: d.active,
@@ -1048,6 +1081,8 @@ document.addEventListener('change', (e) => {
       const [f, s] = el.value.split('-').map(Number);
       c.fast = f;
       c.slow = s;
+    } else if (el.dataset.field === 'mode') {
+      c.mode = el.value;
     } else if (el.dataset.field === 'period') {
       c.period = Number(el.value);
     } else return;
