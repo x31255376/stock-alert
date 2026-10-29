@@ -304,14 +304,15 @@ async function render() {
     setNav(null);
     return renderTerms();
   }
-  if (path === '/recovered' && params.get('c')) {
-    state.code = params.get('c');
-    storeSet('sa_code', state.code);
-    state.me = null;
-    state.watch = null;
-    history.replaceState(null, '', '#/');
+  if (path === '/recover' && params.get('c')) {
     setNav(null);
-    return renderWelcome(state.code, true);
+    $view.className = 'view welcome no-nav';
+    $view.innerHTML = `
+      <img src="/icons/icon-192.png" alt="">
+      <h1>${L('找回帳號', 'Recover your account')}</h1>
+      <p>${L('按下按鈕會產生一組新的帳號代碼並登入，舊代碼會失效。', 'Tap below to get a new account code and sign in. The old code will stop working.')}</p>
+      <button class="btn" data-act="confirm-recover" data-c="${esc(params.get('c'))}">${L('產生新代碼並登入', 'Get a new code and sign in')}</button>`;
+    return;
   }
   if (!state.code) {
     setNav(null);
@@ -1290,6 +1291,16 @@ document.addEventListener('click', async (e) => {
         document.getElementById('login-form').classList.remove('hidden');
         document.getElementById('login-code').focus();
         return;
+      case 'confirm-recover': {
+        el.disabled = true;
+        const { code } = await api('/api/recover/confirm', { method: 'POST', body: { c: el.dataset.c } });
+        state.code = code;
+        storeSet('sa_code', code);
+        state.me = null;
+        state.watch = null;
+        history.replaceState(null, '', '#/');
+        return renderWelcome(code, true);
+      }
       case 'show-recover':
         document.getElementById('recover-form').classList.remove('hidden');
         document.getElementById('recover-email').focus();

@@ -212,16 +212,25 @@ async function route(request, env, ctx, url, lang) {
     return json({ ok: true });
   }
 
+  // The emailed link only opens the app; the code is changed on an explicit button press (POST), so
+  // email security scanners that pre-open links cannot use it up.
   if (path === '/api/recover/verify' && method === 'GET') {
-    const c = url.searchParams.get('c') || '';
+    const c = (url.searchParams.get('c') || '').replace(/[^a-f0-9]/g, '');
+    return Response.redirect(`${url.origin}/#/recover?c=${c}`, 302);
+  }
+
+  if (path === '/api/recover/confirm' && method === 'POST') {
+    const body = await readBody(request);
+    await rateLimit(db, 'login', ip, now);
+    const c = String(body.c || '');
     const link = await db.prepare("SELECT * FROM link_codes WHERE code = ? AND kind = 'recover'").bind(c).first();
-    if (!link || link.expires_at < now) return Response.redirect(`${url.origin}/#/?recover=expired`, 302);
+    if (!link || link.expires_at < now) throw bad('連結已過期，請重新申請', 'That link has expired. Please request a new one.');
     const code = randomCode(16);
     await db.batch([
       db.prepare('UPDATE users SET code_hash = ? WHERE id = ?').bind(await sha256Hex(code), link.user_id),
       db.prepare("DELETE FROM link_codes WHERE user_id = ? AND kind = 'recover'").bind(link.user_id),
     ]);
-    return Response.redirect(`${url.origin}/#/recovered?c=${formatAccountCode(code)}`, 302);
+    return json({ code: formatAccountCode(code) });
   }
 
   if (path === '/api/telegram/webhook' && method === 'POST') {

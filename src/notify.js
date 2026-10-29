@@ -70,7 +70,8 @@ async function sendWebPush(env, appUrl, channel, msg) {
   const meta = parseJson(channel.meta, {});
   const subscription = { endpoint: channel.target, expirationTime: null, keys: meta.keys || {} };
   const vapid = { subject: cleanKey(env.VAPID_SUBJECT) || appUrl || 'mailto:admin@example.com', ...vapidKeys(env) };
-  const data = JSON.stringify({ title: msg.title, body: msg.body, url: msg.url || '/', tag: msg.tag });
+  // Encrypted push payloads are capped at ~4 KB (CJK text is 3 bytes per character).
+  const data = JSON.stringify({ title: String(msg.title || '').slice(0, 120), body: String(msg.body || '').slice(0, 900), url: msg.url || '/', tag: msg.tag });
   const payload = await buildPushPayload({ data, options: { ttl: 3600, urgency: 'high' } }, subscription, vapid);
   const res = await fetch(subscription.endpoint, payload);
   const ok = res.status >= 200 && res.status < 300;

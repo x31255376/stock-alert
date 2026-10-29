@@ -13,6 +13,7 @@ const QUOTES_PER_TICK = 20; // Finnhub free: 60/min, leave room for the app's ow
 const BARS_PER_TICK = 5; // Twelve Data free: 8/min
 const OUTBOUND_BUDGET = 46; // Workers Free: 50 subrequests per run
 const PENDING_PER_TICK = 25;
+const STATUS_EVERY_MS = 5 * 60000;
 
 // Twelve Data publishes the previous session's full volume after midnight New York time.
 const DAILY_READY_MIN = 60; // 01:00 New York
@@ -89,10 +90,11 @@ export async function runTick(env, now = Date.now()) {
   const alertSymbols = [...new Set(alertRows.map((a) => a.symbol))];
 
   if (alertSymbols.length) {
-    const marks = alertSymbols.map(() => '?').join(',');
+    // Whole-table reads (both tables only hold symbols someone follows) — an IN (...) list would hit
+    // D1's 100-bound-parameter limit once more than 100 symbols have alerts.
     const [quoteRes, barMetaRes] = await db.batch([
-      db.prepare(`SELECT * FROM quotes WHERE symbol IN (${marks})`).bind(...alertSymbols),
-      db.prepare(`SELECT symbol, updated_at FROM bars WHERE symbol IN (${marks})`).bind(...alertSymbols),
+      db.prepare('SELECT symbol, updated_at FROM quotes'),
+      db.prepare('SELECT symbol, updated_at FROM bars'),
     ]);
     const quoteBySymbol = new Map(quoteRes.results.map((r) => [r.symbol, r]));
     const barsUpdated = new Map(barMetaRes.results.map((r) => [r.symbol, r.updated_at]));
@@ -172,11 +174,10 @@ export async function runTick(env, now = Date.now()) {
     const needStored = [...wantBars].filter((s) => !barsFetched.has(s));
     const allBars = new Map(barsFetched);
     if (needStored.length) {
-      const { results } = await db
-        .prepare(`SELECT symbol, data FROM bars WHERE symbol IN (${needStored.map(() => '?').join(',')})`)
-        .bind(...needStored)
-        .all();
-      for (const r of results) allBars.set(r.symbol, unpackBars(r.data));
+      const chunks = [];
+      for (let i = 0; i < needStored.length; i += 90) chunks.push(needStored.slice(i, i + 90));
+      const res = await db.batch(chunks.map((c) => db.prepare(`SELECT symbol, data FROM bars WHERE symbol IN (${c.map(() => '?').join(',')})`).bind(...c)));
+      for (const r of res.flatMap((x) => x.results)) allBars.set(r.symbol, unpackBars(r.data));
     }
 
     // ---- 4a. live alerts: daily bars + the current price ----
@@ -216,7 +217,10 @@ export async function runTick(env, now = Date.now()) {
       } else if (r.near && a.last_near_day !== market.date && a.last_trigger_day !== market.date) {
         writes.push(nearEvent(db, a, a.lang === 'en' ? `${a.symbol} close to triggering` : `${a.symbol} 接近觸發`, r, detail, now), db.prepare('UPDATE alerts SET last_near_day = ? WHERE id = ?').bind(market.date, a.id));
       }
-      writes.push(db.prepare('UPDATE alerts SET status = ?, status_detail = ?, checked_at = ? WHERE id = ?').bind(status, detail, now, a.id));
+      // Save the live status only when it changes (or every few minutes) to stay well inside D1's daily write quota.
+      if (fire || status !== a.status || !a.checked_at || now - a.checked_at >= STATUS_EVERY_MS) {
+        writes.push(db.prepare('UPDATE alerts SET status = ?, status_detail = ?, checked_at = ? WHERE id = ?').bind(status, detail, now, a.id));
+      }
     }
 
     // ---- 4b. close-confirmed alerts: once per completed session, on full daily data ----
@@ -293,20 +297,27 @@ export function inQuietHours(user, now) {
 
 async function deliverPending(env, now, outbound) {
   const db = env.DB;
-  const { results: pending } = await db
-    .prepare("SELECT * FROM events WHERE delivery = 'pending' ORDER BY created_at LIMIT ?")
-    .bind(PENDING_PER_TICK)
+  // Look past users who are in quiet hours, so their held notifications never block anyone else's.
+  const { results: rows } = await db
+    .prepare(
+      `SELECT e.*, u.tz AS u_tz, u.lang AS u_lang, u.quiet_on, u.quiet_start, u.quiet_end
+       FROM events e JOIN users u ON u.id = e.user_id
+       WHERE e.delivery = 'pending' ORDER BY e.created_at LIMIT 500`
+    )
     .all();
+  const users = new Map();
+  for (const r of rows) {
+    if (!users.has(r.user_id)) users.set(r.user_id, { id: r.user_id, tz: r.u_tz, lang: r.u_lang, quiet_on: r.quiet_on, quiet_start: r.quiet_start, quiet_end: r.quiet_end });
+  }
+  const pending = rows.filter((r) => !inQuietHours(users.get(r.user_id), now)).slice(0, PENDING_PER_TICK);
   if (!pending.length) return 0;
   const userIds = [...new Set(pending.map((e) => e.user_id))];
   const marks = userIds.map(() => '?').join(',');
-  const [usersRes, chRes, urlRes] = await db.batch([
-    db.prepare(`SELECT * FROM users WHERE id IN (${marks})`).bind(...userIds),
+  const [chRes, urlRes] = await db.batch([
     db.prepare(`SELECT * FROM channels WHERE user_id IN (${marks})`).bind(...userIds),
     db.prepare("SELECT value FROM meta WHERE key = 'app_url'"),
   ]);
   const appUrl = urlRes.results[0]?.value || null;
-  const users = new Map(usersRes.results.map((u) => [u.id, u]));
   const available = availableChannels(env);
   const updates = [];
   const toDelete = [];
@@ -320,7 +331,6 @@ async function deliverPending(env, now, outbound) {
       for (const e of events) updates.push(db.prepare("UPDATE events SET delivery = 'none' WHERE id = ?").bind(e.id));
       continue;
     }
-    if (inQuietHours(user, now)) continue; // stays pending; sent as a summary once quiet hours end
 
     // Limit to the channels the alerts asked for (none listed = all connected channels).
     const wanted = new Set();
