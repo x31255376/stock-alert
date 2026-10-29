@@ -41,6 +41,7 @@ const LIMITS = {
   recover: [5, 3600000], // recovery emails per IP per hour
   search: [60, 60000], // searches per account per minute
   write: [120, 60000], // changes per account per minute
+  nocheck: [2, 3600000], // sign-ups / recoveries per IP per hour when the visitor's browser could not load Turnstile
 };
 
 export async function handleApi(request, env, ctx) {
@@ -98,8 +99,13 @@ async function rateLimit(db, name, subject, now) {
 }
 
 // Cloudflare Turnstile (bot check). Only enforced when TURNSTILE_SECRET is set.
-async function checkTurnstile(env, request, token) {
+async function checkTurnstile(env, request, token, unavailable) {
   if (!env.TURNSTILE_SECRET) return;
+  if (!token && unavailable) {
+    // The widget is blocked on some networks / browsers: allow, but with a much tighter per-IP limit.
+    await rateLimit(env.DB, 'nocheck', clientIp(request), Date.now());
+    return;
+  }
   if (!token) throw bad('請先完成機器人驗證', 'Please complete the verification first');
   const form = new FormData();
   form.append('secret', cleanKey(env.TURNSTILE_SECRET));
@@ -154,7 +160,7 @@ async function route(request, env, ctx, url, lang) {
   if (path === '/api/account' && method === 'POST') {
     const body = await readBody(request);
     await rateLimit(db, 'account', ip, now);
-    await checkTurnstile(env, request, body.turnstile);
+    await checkTurnstile(env, request, body.turnstile, body.turnstileUnavailable === true);
     const code = randomCode(16);
     const id = randomHex(12);
     const tz = isValidTimeZone(body.tz) ? body.tz : 'UTC';
@@ -180,7 +186,7 @@ async function route(request, env, ctx, url, lang) {
     if (!availableChannels(env).email) throw bad('Email 功能尚未開放', 'Email is not available');
     const body = await readBody(request);
     await rateLimit(db, 'recover', ip, now);
-    await checkTurnstile(env, request, body.turnstile);
+    await checkTurnstile(env, request, body.turnstile, body.turnstileUnavailable === true);
     const address = String(body.address || '').trim().toLowerCase();
     if (!/^[^\s@]{1,64}@[^\s@]{1,190}\.[a-z]{2,}$/.test(address)) throw bad('Email 格式不正確', 'Invalid email address');
     const { results } = await db

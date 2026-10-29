@@ -33,6 +33,7 @@ const state = {
   telegramPolling: null,
   openForm: null, // which channel form is expanded in settings
   turnstileToken: null,
+  turnstileUnavailable: false, // widget could not load (network / blocker): fall back to stricter limits
 };
 
 // L('中文', 'English') picks the text for the current language.
@@ -360,6 +361,7 @@ async function mountTurnstile() {
   const box = document.getElementById('turnstile');
   if (!key || !box) return;
   state.turnstileToken = null;
+  state.turnstileUnavailable = false;
   try {
     await loadTurnstile();
     if (!document.getElementById('turnstile')) return;
@@ -372,9 +374,16 @@ async function mountTurnstile() {
       'expired-callback': () => {
         state.turnstileToken = null;
       },
+      'error-callback': (code) => {
+        console.warn('turnstile error', code);
+        state.turnstileUnavailable = true;
+        return true;
+      },
     });
   } catch {
-    box.textContent = L('驗證元件載入失敗，請重新整理', 'Could not load the verification. Please reload.');
+    // The check is optional for the visitor: if it cannot load, sign-up still works with stricter limits.
+    state.turnstileUnavailable = true;
+    box.classList.add('hidden');
   }
 }
 
@@ -386,7 +395,9 @@ function resetTurnstile() {
 }
 
 function requireTurnstile() {
-  if (state.config?.turnstileSiteKey && !state.turnstileToken) throw new Error(L('請先完成機器人驗證', 'Please complete the verification first'));
+  if (state.config?.turnstileSiteKey && !state.turnstileToken && !state.turnstileUnavailable) {
+    throw new Error(L('請先完成機器人驗證（勾選上方方框）', 'Please complete the verification above first'));
+  }
   return state.turnstileToken;
 }
 
@@ -448,7 +459,7 @@ async function createAccount() {
   const turnstile = requireTurnstile();
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   try {
-    const { code } = await api('/api/account', { method: 'POST', body: { tz, lang: state.lang, turnstile } });
+    const { code } = await api('/api/account', { method: 'POST', body: { tz, lang: state.lang, turnstile, turnstileUnavailable: state.turnstileUnavailable } });
     state.code = code;
     storeSet('sa_code', code);
     renderWelcome(code);
@@ -1453,7 +1464,7 @@ document.addEventListener('submit', async (e) => {
     } else if (form.id === 'recover-form') {
       const turnstile = requireTurnstile();
       try {
-        await api('/api/recover', { method: 'POST', body: { address: form.querySelector('#recover-email').value, turnstile } });
+        await api('/api/recover', { method: 'POST', body: { address: form.querySelector('#recover-email').value, turnstile, turnstileUnavailable: state.turnstileUnavailable } });
       } finally {
         resetTurnstile();
       }
