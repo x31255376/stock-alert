@@ -76,7 +76,10 @@ async function sendWebPush(env, appUrl, channel, msg) {
   const ok = res.status >= 200 && res.status < 300;
   // Push services explain rejections in the body (Apple: {"reason":"BadJwtToken"}).
   const detail = ok ? '' : (await res.text().catch(() => '')).slice(0, 160);
-  return { ok, gone: res.status === 404 || res.status === 410, status: res.status, detail, host: new URL(subscription.endpoint).host };
+  // A subscription made with an older VAPID key can never succeed again: treat it as gone so the
+  // device shows "Turn on" and resubscribes with the current key.
+  const staleKey = /VapidPkHashMismatch/i.test(detail) || (res.status === 403 && /vapid/i.test(detail));
+  return { ok, gone: res.status === 404 || res.status === 410 || staleKey, status: res.status, detail, host: new URL(subscription.endpoint).host };
 }
 
 async function sendTelegram(env, appUrl, channel, msg) {
